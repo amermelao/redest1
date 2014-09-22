@@ -1,1 +1,9 @@
-/.project
+*
+-.gitignore
+-*.c
+-*.h
+-Make*
+-*.pdf
+-bwc
+-bws
+-bwc-orig
