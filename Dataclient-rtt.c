@@ -58,13 +58,18 @@ struct {
 
 /* Funciones utilitarias */
 
+#define MIN_ 0.004545454545454545/*Minimos y maximos del timeout*/
+#define MAX_ 2.727272727272727/*son divididos por 1.1*/
+
 /* David: RTT promedio de la ventana */
 double getRTT() {
     int i;
     double sum = 0.0;
     for(i=0; i<SIZE_RTT; i++)
 	sum+=(connection.rtt[i]);
-    return sum/SIZE_RTT;
+    sum = sum/SIZE_RTT;/*Condiciones minimas y maximas de time out*/
+    sum = sum<MIN_?MIN_:(sum>MAX_?MAX_:sum);
+    return sum;
 }
 
 /* retorna hora actual */
