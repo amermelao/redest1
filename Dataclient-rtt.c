@@ -53,21 +53,29 @@ struct {
     int state;                           /* FREE, CONNECTED, CLOSED */
     int id;                              /* id conexión, la asigna el servidor */
     double rtt[SIZE_RTT];		 /* David: arreglo de RTTs históricos */
+    double rtt_time[SIZE_RTT];           /*Roberto: se agrega un arregle que almacena el tiempo en que se agrega un nuevo elemento al arreglo*/
+    double timeRef;                     /*Roberto: para tener una referencia del tiempo*/
     int rtt_idx;			 /* David: indicador de rtt a actualizar */
 } connection;
 
 /* Funciones utilitarias */
 
-#define MIN_ 0.004545454545454545/*Minimos y maximos del timeout*/
-#define MAX_ 2.727272727272727/*son divididos por 1.1*/
+#define MIN_ 0.004545454545454545/*Roberto:Minimos y maximos del timeout*/
+#define MAX_ 2.727272727272727/*Roberto:son divididos por 1.1*/
 
 /* David: RTT promedio de la ventana */
 double getRTT() {
     int i;
+    double peso;
     double sum = 0.0;
+    double sumWeigth = 0;
     for(i=0; i<SIZE_RTT; i++)
-	sum+=(connection.rtt[i]);
-    sum = sum/SIZE_RTT;/*Condiciones minimas y maximas de time out*/
+    {
+        peso = (connection.rtt_time[i]) - connection.timeRef;
+	sum+=(connection.rtt[i]*peso);
+        sumWeigth+=peso;
+    }
+    sum = sum/sumWeigth;/*Roberto:Condiciones minimas y maximas de time out*/
     sum = sum<MIN_?MIN_:(sum>MAX_?MAX_:sum);
     return sum;
 }
@@ -91,7 +99,7 @@ double Now() {
 }
 
 /* Inicializa estructura conexión */
-int init_connection(int id, double rtt) { /* David: se agrega 'rtt', que es el primer RTT calculado */
+int init_connection(int id, double rtt,double timeRef, double timeNow) { /* David: se agrega 'rtt', que es el primer RTT calculado */
     int cl, i; /* David: variable 'i' agregada */
     pthread_t pid;
     int *p;
@@ -104,9 +112,12 @@ int init_connection(int id, double rtt) { /* David: se agrega 'rtt', que es el p
     connection.expected_seq = 1;
     connection.expected_ack = 0;
     connection.id = id;
-
+    connection.timeRef = timeRef;/*Roberto: se setea la primera referencia*/
     for(i=0; i<SIZE_RTT; i++) /* David: se inicializa arreglo de RTTs */
+    {
 	connection.rtt[i] = rtt;
+        connection.rtt_time[i] = timeNow;/*Se agregan los primeros tiempos*/
+    }
     connection.rtt_idx = 0; /* David: se inicializa indicador de rtt a actualizar en 0 */
 
     return id;
@@ -174,7 +185,7 @@ int Dconnect(char *server, char *port) {
     }
 fprintf(stderr, "conectado con id=%d\n", cl);
     printf("RTT calculado en inicio de conexión: %f\n",t2-t1);
-    init_connection(cl,t2-t1); /* David: se pasa rtt=t2-t1 como parámetro */
+    init_connection(cl,t2-t1,t1,t2); /* David: se pasa rtt=t2-t1 como parámetro, Robeto: y t1,t2, para el calculo de los pesos */
     Init_Dlayer(s); /* Inicializa y crea threads */
     return cl;
 }
@@ -254,8 +265,11 @@ static void *Drcvr(void *ppp) {
 		&& connection.expecting_ack && connection.expected_ack == inbuf[DSEQ]) {
     	    /* David: medimos RTT cuando recibimos ACK */
 	    if(~retrans) { /* Si no hay retransmisión */
+                connection.timeRef = connection.rtt_time[connection.rtt_idx];/*Roberto:se cambia la referencia al valor que se esta lledo*/
+                connection.rtt_time[connection.rtt_idx] = T2; /*Roberto:se pone el tiempo en que fue recibida la respuesta*/
 	        connection.rtt[connection.rtt_idx] = T2-T1; /* David: guardamos nuevo RTT */
                 connection.rtt_idx = (connection.rtt_idx+1)%SIZE_RTT; /* David: modificamos a posición de siguiente RTT a actualizar */
+                
 	    }
 
 	    if(Data_debug)
