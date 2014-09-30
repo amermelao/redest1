@@ -17,4 +17,7 @@ considerando el instante en que fueron calculados. Los más recientes reciben ma
 obtuvo la respuesta. Sólo se consideran los tiempos de los paquetes que han sido transmitidos y confirmados sin
 retransmisión, para lo cual se utiliza una variable 'retrans' que indica si un paquete ha sido retransmitido o no.
 
+  El timeout es calculado como: timeout = getRTT()*1.1. Adicionalmente, en la función 'getRTT()' se incluyen cotas de modo
+que el timeout se encuentre siempre entre 0.005 y 3 segundos.
+
 %%%% Pruebas realizadas %%%%
