@@ -1,0 +1,20 @@
+CC4303 Redes - Tarea 1
+Nombres: - David Acuña U.
+         - Roberto Fuentes P.
+         
+%%%% Estrategia de solución %%%%
+
+  A la estructura 'connection' se le agregan 4 atributos: 'rtt', 'rtt_time', 'timeRef' y 'rtt_idx'. El atributo 'rtt' es un
+arreglo de tamaño 'SIZE_RTT', en el cual se van almacenando distintos valores calculados de RTT. Para ir actualizando este
+arreglo se utiliza el atributo 'rtt_idx' que indica la posición a actualizar. Por otra parte, los atributos 'rtt_time' y
+'timeRef' contienen los tiempos en que fueron calculados dichos RTTs y un tiempo de referencia, respectivamente.
+
+  La idea es que la función 'getRTT()' utiliza las variables antes mencionadas para realizar una estimación del RTT real
+mediante una suma ponderada de cada uno de los RTT almacenados en el atributo 'rtt'. La ponderación se lleva a cabo
+considerando el instante en que fueron calculados. Los más recientes reciben mayor importancia que los más antiguos.
+
+  Se utilizan dos variables globales 'T1' y 'T2' que indican el instante en que se envió un paquete y el instante en que se
+obtuvo la respuesta. Sólo se consideran los tiempos de los paquetes que han sido transmitidos y confirmados sin
+retransmisión, para lo cual se utiliza una variable 'retrans' que indica si un paquete ha sido retransmitido o no.
+
+%%%% Pruebas realizadas %%%%
