@@ -21,3 +21,9 @@ retransmisión, para lo cual se utiliza una variable 'retrans' que indica si un 
 que el timeout se encuentre siempre entre 0.005 y 3 segundos.
 
 %%%% Pruebas realizadas %%%%
+
+---------------------------------------------------------------
+|  Prueba N°  |  Tamaño de archivo  |  Tiempo de transmisión  |
+---------------------------------------------------------------
+|      1      |                     |                         |
+---------------------------------------------------------------
