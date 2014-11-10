@@ -18,6 +18,8 @@
 
 #define MAX_QUEUE 100 /* buffers en boxes */
 #define SIZE_RTT 10 /* David: cantidad de RTTs a promediar */
+#define MIN_TIMEOUT 0.005 /* Roberto: cota inferior timeout */
+#define MAX_TIMEOUT 3.0 /* Roberto: cota superior timeout */
 
 /* Version con threads rdr y sender
  * Implementa Stop and Wait sin seqn, falla frente a algunos errores
@@ -53,15 +55,12 @@ struct {
     int state;                           /* FREE, CONNECTED, CLOSED */
     int id;                              /* id conexión, la asigna el servidor */
     double rtt[SIZE_RTT];		 /* David: arreglo de RTTs históricos */
-    double rtt_time[SIZE_RTT];           /*Roberto: se agrega un arregle que almacena el tiempo en que se agrega un nuevo elemento al arreglo*/
-    double timeRef;                     /*Roberto: para tener una referencia del tiempo*/
+    double rtt_time[SIZE_RTT];           /* Roberto: se agrega un arregle que almacena el tiempo en que se agrega un nuevo elemento al arreglo*/
+    double timeRef;                      /* Roberto: para tener una referencia del tiempo*/
     int rtt_idx;			 /* David: indicador de rtt a actualizar */
 } connection;
 
 /* Funciones utilitarias */
-
-#define MIN_ 0.004545454545454545/*Roberto:Minimos y maximos del timeout*/
-#define MAX_ 2.727272727272727/*Roberto:son divididos por 1.1*/
 
 /* David: RTT promedio de la ventana */
 double getRTT() {
@@ -69,14 +68,13 @@ double getRTT() {
     double peso;
     double sum = 0.0;
     double sumWeigth = 0;
-    for(i=0; i<SIZE_RTT; i++)
-    {
-        peso = (connection.rtt_time[i]) - connection.timeRef;
+    for(i=0; i<SIZE_RTT; i++) {
+        peso = connection.rtt_time[i] - connection.timeRef;
 	sum+=(connection.rtt[i]*peso);
         sumWeigth+=peso;
     }
-    sum = sum/sumWeigth;/*Roberto:Condiciones minimas y maximas de time out*/
-    sum = sum<MIN_?MIN_:(sum>MAX_?MAX_:sum);
+    sum/=sumWeigth; /* Roberto: condiciones minimas y maximas de time out*/
+    sum = sum*1.1<MIN_TIMEOUT ? MIN_TIMEOUT/1.1 : (sum*1.1>MAX_TIMEOUT ? MAX_TIMEOUT/1.1 : sum);
     return sum;
 }
 
@@ -113,8 +111,7 @@ int init_connection(int id, double rtt,double timeRef, double timeNow) { /* Davi
     connection.expected_ack = 0;
     connection.id = id;
     connection.timeRef = timeRef;/*Roberto: se setea la primera referencia*/
-    for(i=0; i<SIZE_RTT; i++) /* David: se inicializa arreglo de RTTs */
-    {
+    for(i=0; i<SIZE_RTT; i++) { /* David: se inicializa arreglo de RTTs */
 	connection.rtt[i] = rtt;
         connection.rtt_time[i] = timeNow;/*Se agregan los primeros tiempos*/
     }
@@ -150,7 +147,6 @@ int Dconnect(char *server, char *port) {
     int s, cl, i;
     struct sigaction new, old;
     unsigned char inbuf[DHDR], outbuf[DHDR];
-    double t1, t2; /* David: indicadores de tiempo para cálculo de RTT inicial */
 
     if(Dsock != -1) return -1;
 
@@ -167,11 +163,11 @@ int Dconnect(char *server, char *port) {
     outbuf[DID] = 0;
     outbuf[DSEQ] = 0;
     for(i=0; i < RETRIES; i++) {
-	t1 = Now(); /* David: se inicia conteo */
+	T1 = Now(); /* David: se inicia conteo */
         send(s, outbuf, DHDR, 0);
 	alarm(INTTIMEOUT);
 	if(recv(s, inbuf, DHDR, 0) != DHDR) continue;
-	t2 = Now(); /* David: se finaliza conteo */
+	T2 = Now(); /* David: se finaliza conteo */
 	if(Data_debug) fprintf(stderr, "recibo: %c, %d\n", inbuf[DTYPE], inbuf[DID]);
 	alarm(0);
 	if(inbuf[DTYPE] != ACK || inbuf[DSEQ] != 0) continue;
@@ -184,8 +180,8 @@ int Dconnect(char *server, char *port) {
 	return -1;
     }
 fprintf(stderr, "conectado con id=%d\n", cl);
-    printf("RTT calculado en inicio de conexión: %f\n",t2-t1);
-    init_connection(cl,t2-t1,t1,t2); /* David: se pasa rtt=t2-t1 como parámetro, Robeto: y t1,t2, para el calculo de los pesos */
+    printf("RTT calculado en inicio de conexión: %f\n",T2-T1);
+    init_connection(cl,T2-T1,T1,T2); /* David: se pasa rtt=T2-T1 como parámetro, Robeto: y T1,T2, para el calculo de los pesos */
     Init_Dlayer(s); /* Inicializa y crea threads */
     return cl;
 }
@@ -265,8 +261,8 @@ static void *Drcvr(void *ppp) {
 		&& connection.expecting_ack && connection.expected_ack == inbuf[DSEQ]) {
     	    /* David: medimos RTT cuando recibimos ACK */
 	    if(~retrans) { /* Si no hay retransmisión */
-                connection.timeRef = connection.rtt_time[connection.rtt_idx];/*Roberto:se cambia la referencia al valor que se esta lledo*/
-                connection.rtt_time[connection.rtt_idx] = T2; /*Roberto:se pone el tiempo en que fue recibida la respuesta*/
+                connection.timeRef = connection.rtt_time[connection.rtt_idx];/* Roberto: se cambia la referencia al valor que se esta lledo*/
+                connection.rtt_time[connection.rtt_idx] = T2; /* Roberto: se pone el tiempo en que fue recibida la respuesta*/
 	        connection.rtt[connection.rtt_idx] = T2-T1; /* David: guardamos nuevo RTT */
                 connection.rtt_idx = (connection.rtt_idx+1)%SIZE_RTT; /* David: modificamos a posición de siguiente RTT a actualizar */
                 
@@ -321,7 +317,7 @@ double Dclient_timeout_or_pending_data() {
     double timeout;
 /* Suponemos lock ya tomado! */
 
-    timeout = Now() + getRTT()*1.1; /* David: antes era Now()+20.0 */
+    timeout = Now() + getRTT()*1.1;/* David: antes era Now()+20.0 */
 	if(connection.state == FREE) return timeout;
 
 	if(boxsz(connection.wbox) != 0 && !connection.expecting_ack)
