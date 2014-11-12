@@ -38,6 +38,7 @@ static pthread_t Drcvr_pid, Dsender_pid;
 static unsigned char ack[DHDR] = {0, ACK, 0};
 double T1, T2; /* David: variables globales para calcular RTTs */
 int retrans = 0; /* David: 0 si no se ha retransmitido, 1 lo contrario */
+char LAR = -1, LFS = 0; /* David: LAR y LFS de Go-back-N . Roberto: Se inicializa en -1 para que la promera vez se haga 0*/
 
 static void *Dsender(void *ppp);
 static void *Drcvr(void *ppp);
@@ -89,6 +90,13 @@ double getRTT() {
     sum = sum*1.1<MIN_TIMEOUT ? MIN_TIMEOUT/1.1 : (sum*1.1>MAX_TIMEOUT ? MAX_TIMEOUT/1.1 : sum);
     return sum;
 }
+
+int seqIsHeigher(int seqBuffPackage, int seqAKG){
+    if(seqAKG < 49 && seqBuffPackage > 150)
+        seqAKG += 256;
+    return seqBuffPackage <= seqAKG;
+}
+
 
 /* retorna hora actual */
 double Now() {
@@ -270,7 +278,8 @@ static void *Drcvr(void *ppp) {
 	    Dclose(cl);
 	}
 	else if(inbuf[DTYPE] == ACK && connection.state != FREE
-		&& connection.expecting_ack && connection.expected_ack == inbuf[DSEQ]) {
+		&& connection.expecting_ack && seqIsHeigher( LAR + 1,inbuf[DSEQ]) && seqIsHeigher(inbuf[DSEQ],LFS) )
+        {
     	    /* David: medimos RTT cuando recibimos ACK */
 	    if(~retrans) { /* Si no hay retransmisión */
                 connection.timeRef = connection.rtt_time[connection.rtt_idx];/* Roberto: se cambia la referencia al valor que se esta lledo*/
@@ -283,7 +292,18 @@ static void *Drcvr(void *ppp) {
 	    if(Data_debug)
 		fprintf(stderr, "recv ACK id=%d, seq=%d\n", cl, inbuf[DSEQ]);
 
-	    connection.expecting_ack = 0;
+	    //connection.expecting_ack = 0;
+            int cont;
+            for (cont = 1;  cont <= SWS; cont++)
+            {
+                int index = (BackUp.LASTSENDINBOX + cont ) % 50;
+                
+                if(BackUp.pending_buf[index][DSEQ] == inbuf[DSEQ])
+                {
+                    BackUp.ack[index] = 1;
+                    break;
+                }
+            }
 	    if(connection.state == CLOSED) {
 		/* conexion cerrada y sin buffers pendientes */
 		del_connection();
