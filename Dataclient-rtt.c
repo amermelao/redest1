@@ -52,7 +52,7 @@ struct {
     unsigned char pending_buf[BUF_SIZE]; /* buffer esperando ack */
     int pending_sz;  			 /* tamaño buffer esperando */
     int expecting_ack;			 /* 1: esperando ack */
-    char expected_seq, expected_ack;    /* 0 o 1 */
+    //char unsigned expected_seq, expected_ack;    /* 0 o 1 */
     int retries;                         /* cuantas veces he retransmitido */
     double timeout;                      /* tiempo restante antes de retransmision */
     int state;                           /* FREE, CONNECTED, CLOSED */
@@ -139,8 +139,8 @@ int init_connection(int id, double rtt,double timeRef, double timeNow) { /* Davi
     connection.rbox = create_bufbox(MAX_QUEUE);
     connection.pending_sz = -1;
     connection.expecting_ack = 0;
-    connection.expected_seq = 1;
-    connection.expected_ack = 0;
+    /*connection.expected_seq = 1;
+    connection.expected_ack = 0;*/
     connection.id = id;
     connection.timeRef = timeRef;/*Roberto: se setea la primera referencia*/
     for(i=0; i<SIZE_RTT; i++) { /* David: se inicializa arreglo de RTTs */
@@ -293,11 +293,11 @@ static void *Drcvr(void *ppp) {
 	    if(send(Dsock, ack, DHDR, 0) < 0) {
 		perror("send"); exit(2);
 	    }
-	    if(inbuf[DSEQ] != connection.expected_seq) {
+	    if(inbuf[DSEQ] != LFS/*connection.expected_seq*/) {
 		pthread_mutex_unlock(&Dlock);
 		continue;
 	    }
-	    connection.expected_seq = (connection.expected_seq+1)%2;
+	    /*connection.expected_seq = (connection.expected_seq+1)%2;*/
 	    connection.state = CLOSED;
 	    Dclose(cl);
 	}
@@ -319,9 +319,7 @@ static void *Drcvr(void *ppp) {
                         connection.rtt[connection.rtt_idx] = T2-T1; /* David: guardamos nuevo RTT */
                         connection.rtt_idx = (connection.rtt_idx+1)%SIZE_RTT; /* David: modificamos a posición de siguiente RTT a actualizar */
                     }
-                    
-                    /*if( ((BackUp.LASTSENDINBOX + 1) == index) && (BackUp.ack[index] == 0))Roberto: solo se actualiza LAR cuando se va a mover la ventan
-                        LAR = (LAR + 1) % SEQSIZE;*/
+
                     BackUp.ack[index] = 1;
                     if(Data_debug)
                         fprintf(stderr, "recv ACK id=%d, seq=%d\n", cl, inbuf[DSEQ]);
@@ -335,7 +333,7 @@ static void *Drcvr(void *ppp) {
 	    pthread_cond_signal(&Dcond);
 	}
 	else if(inbuf[DTYPE] == DATA && connection.state == CONNECTED) {
-	    if(Data_debug) fprintf(stderr, "rcv: DATA: %d, seq=%d, expected=%d\n", inbuf[DID], inbuf[DSEQ], connection.expected_seq);
+	    if(Data_debug) fprintf(stderr, "rcv: DATA: %d, seq=%d, expected=%d\n", inbuf[DID], inbuf[DSEQ], /*connection.expected_seq*/LFS);
 	    if(boxsz(connection.rbox) >= MAX_QUEUE) { /* No tengo espacio */
 		pthread_mutex_unlock(&Dlock);
 		continue;
@@ -350,11 +348,11 @@ static void *Drcvr(void *ppp) {
 	    if(send(Dsock, ack, DHDR, 0) <0)
 		perror("sendack");
 
-	    if(inbuf[DSEQ] != connection.expected_seq) {
+	    /*if(inbuf[DSEQ] != connection.expected_seq) {
 		pthread_mutex_unlock(&Dlock);
 		continue;
 	    }
-            connection.expected_seq = (connection.expected_seq+1)%SEQSIZE;
+            connection.expected_seq = (connection.expected_seq+1)%SEQSIZE;-*/
 	/* enviar a la cola */
 	    putbox(connection.rbox, (char *)inbuf+DHDR, cnt-DHDR);
         }
