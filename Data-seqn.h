@@ -17,7 +17,7 @@
 
 #define TIMEOUT 1.0
 #define INTTIMEOUT 3
-#define RETRIES 10
+#define RETRIES 40
 
 extern int Data_debug;
 

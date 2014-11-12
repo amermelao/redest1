@@ -16,7 +16,6 @@
 #include "bufbox.h"
 #include "Data-seqn.h"
 
-
 #define MAX_QUEUE 100 /* buffers en boxes */
 #define SIZE_RTT 10 /* David: cantidad de RTTs a promediar */
 #define MIN_TIMEOUT 0.005 /* Roberto: cota inferior timeout */
@@ -292,7 +291,7 @@ static void *Drcvr(void *ppp) {
 	    ack[DTYPE] = ACK;
 	    ack[DSEQ] = inbuf[DSEQ];
 	    if(send(Dsock, ack, DHDR, 0) < 0) {
-		perror("send"); exit(1);
+		perror("send"); exit(2);
 	    }
 	    if(inbuf[DSEQ] != connection.expected_seq) {
 		pthread_mutex_unlock(&Dlock);
@@ -304,18 +303,7 @@ static void *Drcvr(void *ppp) {
 	}
 	else if(inbuf[DTYPE] == ACK && connection.state != FREE	&& connection.expecting_ack && seqIsHeigher( LAR + 1,inbuf[DSEQ]) && seqIsHeigher(inbuf[DSEQ],LFS) )
         {
-    	    /* David: medimos RTT cuando recibimos ACK */
-	    if(~retrans) { /* Si no hay retransmisión */
-                connection.timeRef = connection.rtt_time[connection.rtt_idx];/* Roberto: se cambia la referencia al valor que se esta lledo*/
-                connection.rtt_time[connection.rtt_idx] = T2; /* Roberto: se pone el tiempo en que fue recibida la respuesta*/
-	        connection.rtt[connection.rtt_idx] = T2-T1; /* David: guardamos nuevo RTT */
-                connection.rtt_idx = (connection.rtt_idx+1)%SIZE_RTT; /* David: modificamos a posición de siguiente RTT a actualizar */
-                
-	    }
-
-	    
-
-	    //connection.expecting_ack = 0;
+    	    //connection.expecting_ack = 0;
             int cont;
             for (cont = 1;  cont <= SWS; cont++)
             {
@@ -323,6 +311,17 @@ static void *Drcvr(void *ppp) {
                 
                 if(BackUp.pending_buf[index][DSEQ] == inbuf[DSEQ])
                 {
+                    /* David: medimos RTT cuando recibimos ACK */
+                    if(BackUp.pending_buf[index][DRET] == inbuf[DRET]) 
+                    { /* Si no hay retransmisión */
+                        connection.timeRef = connection.rtt_time[connection.rtt_idx];/* Roberto: se cambia la referencia al valor que se esta lledo*/
+                        connection.rtt_time[connection.rtt_idx] = T2; /* Roberto: se pone el tiempo en que fue recibida la respuesta*/
+                        connection.rtt[connection.rtt_idx] = T2-T1; /* David: guardamos nuevo RTT */
+                        connection.rtt_idx = (connection.rtt_idx+1)%SIZE_RTT; /* David: modificamos a posición de siguiente RTT a actualizar */
+                    }
+                    
+                    /*if( ((BackUp.LASTSENDINBOX + 1) == index) && (BackUp.ack[index] == 0))Roberto: solo se actualiza LAR cuando se va a mover la ventan
+                        LAR = (LAR + 1) % SEQSIZE;*/
                     BackUp.ack[index] = 1;
                     if(Data_debug)
                         fprintf(stderr, "recv ACK id=%d, seq=%d\n", cl, inbuf[DSEQ]);
@@ -359,8 +358,8 @@ static void *Drcvr(void *ppp) {
 	/* enviar a la cola */
 	    putbox(connection.rbox, (char *)inbuf+DHDR, cnt-DHDR);
         }
-	else if(Data_debug) {
-	    fprintf(stderr, "descarto paquete entrante: t=%c, id=%d\n", inbuf[DTYPE], inbuf[DID]);
+	else if(Data_debug ) {
+	    fprintf(stderr, "descarto paquete entrante: t=%c, id=%d, seq=%d , LAR=%d, LFS=%d\n", inbuf[DTYPE], inbuf[DID],inbuf[DSEQ],LAR,LFS);
 	}
 
 	pthread_mutex_unlock(&Dlock);
@@ -436,7 +435,7 @@ static void *Dsender(void *ppp) {
                             {
                                 fprintf(stderr, "too many retries: %d\n", BackUp.pending_buf[idx][DRET]);
                                 del_connection();
-                                exit(1);
+                                exit(3);
                             }
                             send(Dsock, BackUp.pending_buf[idx], DHDR+BackUp.pending_sz[idx], 0);
                             BackUp.sentTime[idx] = Now();
@@ -490,6 +489,7 @@ static void *Dsender(void *ppp) {
                 send(Dsock, connection.pending_buf, DHDR+connection.pending_sz, 0);
 
                 BackUp.LASTSENDINBOX = (BackUp.LASTSENDINBOX + 1) % SWS;
+                LAR = BackUp.pending_buf[BackUp.LASTSENDINBOX][DSEQ];
                 wBackUp(connection.pending_buf, connection.pending_sz, BackUp.LASTSENDINBOX);
 
                 connection.expecting_ack = 1;
