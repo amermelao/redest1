@@ -284,7 +284,7 @@ static void *Drcvr(void *ppp) {
 	pthread_mutex_lock(&Dlock);
 	if(inbuf[DTYPE] == CLOSE) 
         {
-            if(Data_debug) 
+            if(Data_debug)
                 fprintf(stderr, "recibo cierre conexión %d, envío ACK\n", cl);
             
 	    ack[DID] = cl;
