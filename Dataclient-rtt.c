@@ -41,7 +41,7 @@ static unsigned char ack[DHDR] = {0, ACK, 0};
 double T1, T2; /* David: variables globales para calcular RTTs */
 int retrans = 0; /* David: 0 si no se ha retransmitido, 1 lo contrario */
 char unsigned LAR = -1, LFS = 0; /* David: LAR y LFS de Go-back-N . Roberto: Se inicializa en -1 para que la promera vez se haga 0*/
-char unsigned LAF = 50, LFR = 1; /*Roberto: valores para las ventanas*/
+char unsigned LAF = 50, LFR = 0; /*Roberto: valores para las ventanas*/
 
 static void *Dsender(void *ppp);
 static void *Drcvr(void *ppp);
@@ -142,7 +142,7 @@ void wBackUp(unsigned char *pending_buf, int pending_sz, int index)
     BackUp.ack[index] = 0;
     BackUp.timeout[index] = BackUp.sentTime[index] + getRTT()*1.1;
 }
-
+/*Roberto: para meter las cosas al buff de llegada*/
 void wReciveBuff(unsigned char *pending_buf, int pending_sz, int index) 
 {
     if(ReciveBuff.ack[index] == 0)
@@ -398,12 +398,17 @@ static void *Drcvr(void *ppp) {
             /* enviar a la cola */
                 if(seqIsHeigher(LFR+1, inbuf[DSEQ]))/*Roberto: ver si esta dentro de la ventana*/
                 {
-                    int seqAux = (ReciveBuff.LASTSENDINBOX + getDiff(LAR,inbuf[DSEQ])) % RWS;
-                    wReciveBuff(inbuf, cnt, seqAux); 
-                    
+                    int seqAux = (ReciveBuff.LASTSENDINBOX + getDiff(LFR,inbuf[DSEQ])) % RWS;
+                    wReciveBuff(inbuf, cnt, seqAux);                    
                 }
-                    
-                putbox(connection.rbox, (char *)inbuf+DHDR, cnt-DHDR);
+                while(ReciveBuff.ack[(ReciveBuff.LASTSENDINBOX+1)%RWS] == 1)
+                {
+                    putbox(connection.rbox, ReciveBuff.pending_buf[(ReciveBuff.LASTSENDINBOX+1)%RWS] + DHDR, ReciveBuff.pending_sz[(ReciveBuff.LASTSENDINBOX+1)%RWS]-DHDR);
+                    LFR = (LFR + 1) % SEQSIZE;
+                    LAF = (LAF + 1) % SEQSIZE;
+                    ReciveBuff.LASTSENDINBOX = (ReciveBuff.LASTSENDINBOX+1) % RWS;
+                    ReciveBuff.ack[ReciveBuff.LASTSENDINBOX] = 0;
+                }
             }
         }
 	else if(Data_debug ) {
