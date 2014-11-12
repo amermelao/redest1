@@ -174,11 +174,14 @@ int Dconnect(char *server, char *port) {
     outbuf[DTYPE] = CONNECT;
     outbuf[DID] = 0;
     outbuf[DSEQ] = 0;
+    outbuf[DRET] = 0;
+    int debugV;
     for(i=0; i < RETRIES; i++) {
 	T1 = Now(); /* David: se inicia conteo */
         send(s, outbuf, DHDR, 0);
 	alarm(INTTIMEOUT);
-	if(recv(s, inbuf, DHDR, 0) != DHDR) continue;
+	if((debugV = recv(s, inbuf, DHDR, 0)) != DHDR) /*robert: revisar bien esto*/
+            continue;
 	T2 = Now(); /* David: se finaliza conteo */
 	if(Data_debug) fprintf(stderr, "recibo: %c, %d\n", inbuf[DTYPE], inbuf[DID]);
 	alarm(0);
