@@ -21,6 +21,7 @@
 #define MIN_TIMEOUT 0.005 /* Roberto: cota inferior timeout */
 #define MAX_TIMEOUT 3.0 /* Roberto: cota superior timeout */
 #define SWS 50 /* David: tamaño de ventana de envío */
+#define RWS 50 /* David: tamaño de ventana de envío */
 #define SEQSIZE 256 /*Roberto: tamño de la secuencia*/
 
 /* Version con threads rdr y sender
@@ -40,6 +41,7 @@ static unsigned char ack[DHDR] = {0, ACK, 0};
 double T1, T2; /* David: variables globales para calcular RTTs */
 int retrans = 0; /* David: 0 si no se ha retransmitido, 1 lo contrario */
 char unsigned LAR = -1, LFS = 0; /* David: LAR y LFS de Go-back-N . Roberto: Se inicializa en -1 para que la promera vez se haga 0*/
+char unsigned LAF = 50, LFR = 1; /*Roberto: valores para las ventanas*/
 
 static void *Dsender(void *ppp);
 static void *Drcvr(void *ppp);
@@ -74,6 +76,12 @@ struct {
     int FastRetransmit; /* David: variable estado de Fast Retransmit */
 } BackUp;
 
+struct{
+    unsigned char pending_buf[RWS][BUF_SIZE]; /* David: almacenamiento de paquetes */
+    int pending_sz[RWS]; /* David: tamaño de paquetes */
+    int ack[RWS]; /* David: cuenta cuántos ACKs de un paquete han llegado */
+    unsigned char LASTSENDINBOX; /* David: índice que indica posición de último paquete enviado en la ventana */
+}ReciveBuff;
 /* Funciones utilitarias */
 
 /* David: RTT promedio de la ventana */
@@ -117,7 +125,14 @@ double Now() {
 
     return(tt.tv_sec+1e-9*tt.tv_nsec);
 }
+/*Roberto: diferencia entre dos puntos*/
 
+int getDiff(int seqBuffPackage, int seqAKG)
+{
+    if(seqAKG < 49 && seqBuffPackage > 150)
+        seqAKG += 256;
+    return seqAKG - seqBuffPackage;
+}
 /* David: almacenar paquetes para posible retransmisión en Go-back-N */
 void wBackUp(unsigned char *pending_buf, int pending_sz, int index) 
 {
@@ -126,6 +141,16 @@ void wBackUp(unsigned char *pending_buf, int pending_sz, int index)
     BackUp.pending_sz[index] = pending_sz;
     BackUp.ack[index] = 0;
     BackUp.timeout[index] = BackUp.sentTime[index] + getRTT()*1.1;
+}
+
+void wReciveBuff(unsigned char *pending_buf, int pending_sz, int index) 
+{
+    if(ReciveBuff.ack[index] == 0)
+    {
+        memcpy(ReciveBuff.pending_buf[index],pending_buf,pending_sz + DHDR);/*Robert: strcopy no hacia bn su trabajo*/
+        ReciveBuff.pending_sz[index] = pending_sz;
+        ReciveBuff.ack[index] = 1;
+    }
 }
 
 /* Inicializa estructura conexión */
@@ -155,6 +180,10 @@ int init_connection(int id, double rtt,double timeRef, double timeNow) { /* Davi
         BackUp.timeout[i] = Now() + 1000;
     }
     
+    for(i = 0; i < RWS; i++)
+    {
+        ReciveBuff.ack[i] = 0;
+    }
     return id;
 }
 
@@ -332,29 +361,50 @@ static void *Drcvr(void *ppp) {
 	    }
 	    pthread_cond_signal(&Dcond);
 	}
-	else if(inbuf[DTYPE] == DATA && connection.state == CONNECTED) {
-	    if(Data_debug) fprintf(stderr, "rcv: DATA: %d, seq=%d, expected=%d\n", inbuf[DID], inbuf[DSEQ], /*connection.expected_seq*/LFS);
-	    if(boxsz(connection.rbox) >= MAX_QUEUE) { /* No tengo espacio */
+	else if(inbuf[DTYPE] == DATA && connection.state == CONNECTED) 
+        {
+	    if(Data_debug) 
+                fprintf(stderr, "rcv: DATA: %d, seq=%d, expected=%d\n", inbuf[DID], inbuf[DSEQ], /*connection.expected_seq*/LFS);
+	    if(boxsz(connection.rbox) >= MAX_QUEUE ) 
+            { /* No tengo espacio */
 		pthread_mutex_unlock(&Dlock);
 		continue;
 	    }
 	/* envio ack en todos los otros casos */
+            
 	    ack[DID] = cl;
 	    ack[DTYPE] = ACK;
-	    ack[DSEQ] = inbuf[DSEQ];
+	    
 
-	    if(Data_debug) fprintf(stderr, "Enviando ACK %d, seq=%d\n", ack[DID], ack[DSEQ]);
+            if(seqIsHeigher(LAF+1,inbuf[DSEQ]))
+            {
+                ack[DSEQ] = LFR;
+                ack[DRET] = inbuf[DRET];
+                if(send(Dsock, ack, DHDR, 0) <0)
+                    perror("sendack");
+            }
+            
+            else
+            {
+                ack[DSEQ] = inbuf[DSEQ];
+                ack[DRET] = inbuf[DRET];
+                
+                if(Data_debug) 
+                    fprintf(stderr, "Enviando ACK %d, seq=%d\n", ack[DID], ack[DSEQ]);
 
-	    if(send(Dsock, ack, DHDR, 0) <0)
-		perror("sendack");
+                if(send(Dsock, ack, DHDR, 0) <0)
+                    perror("sendack");
 
-	    /*if(inbuf[DSEQ] != connection.expected_seq) {
-		pthread_mutex_unlock(&Dlock);
-		continue;
-	    }
-            connection.expected_seq = (connection.expected_seq+1)%SEQSIZE;-*/
-	/* enviar a la cola */
-	    putbox(connection.rbox, (char *)inbuf+DHDR, cnt-DHDR);
+            /* enviar a la cola */
+                if(seqIsHeigher(LFR+1, inbuf[DSEQ]))/*Roberto: ver si esta dentro de la ventana*/
+                {
+                    int seqAux = (ReciveBuff.LASTSENDINBOX + getDiff(LAR,inbuf[DSEQ])) % RWS;
+                    wReciveBuff(inbuf, cnt, seqAux); 
+                    
+                }
+                    
+                putbox(connection.rbox, (char *)inbuf+DHDR, cnt-DHDR);
+            }
         }
 	else if(Data_debug ) {
 	    fprintf(stderr, "descarto paquete entrante: t=%c, id=%d, seq=%d , LAR=%d, LFS=%d\n", inbuf[DTYPE], inbuf[DID],inbuf[DSEQ],LAR,LFS);
