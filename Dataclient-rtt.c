@@ -131,7 +131,7 @@ int getDiff(int seqBuffPackage, int seqAKG)
 {
     if(seqAKG < 49 && seqBuffPackage > 150)
         seqAKG += 256;
-    return seqAKG - seqBuffPackage;
+    return seqAKG - seqBuffPackage ;
 }
 /* David: almacenar paquetes para posible retransmisión en Go-back-N */
 void wBackUp(unsigned char *pending_buf, int pending_sz, int index) 
@@ -365,7 +365,7 @@ static void *Drcvr(void *ppp) {
         {
 	    if(Data_debug) 
                 fprintf(stderr, "rcv: DATA: %d, seq=%d, expected=%d\n", inbuf[DID], inbuf[DSEQ], /*connection.expected_seq*/LFS);
-	    if(boxsz(connection.rbox) >= MAX_QUEUE ) 
+	    if( boxsz(connection.rbox) >= MAX_QUEUE ) 
             { /* No tengo espacio */
 		pthread_mutex_unlock(&Dlock);
 		continue;
@@ -376,7 +376,7 @@ static void *Drcvr(void *ppp) {
 	    ack[DTYPE] = ACK;
 	    
 
-            if(seqIsHeigher(LAF+1,inbuf[DSEQ]))
+            if(!seqIsHeigher(inbuf[DSEQ] ,LAF))
             {
                 ack[DSEQ] = LFR;
                 ack[DRET] = inbuf[DRET];
