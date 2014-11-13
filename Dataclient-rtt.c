@@ -376,7 +376,7 @@ static void *Drcvr(void *ppp) {
 	    ack[DTYPE] = ACK;
 	    
 
-            if(!seqIsHeigher(inbuf[DSEQ] ,LAF))
+            if(!seqIsHeigher(inbuf[DSEQ] ,LAF))/*Roberto: para los paqeutes que estan sobre la ventan*/
             {
                 ack[DSEQ] = LFR;
                 ack[DRET] = inbuf[DRET];
@@ -385,7 +385,7 @@ static void *Drcvr(void *ppp) {
             }
             
             else
-            {
+            {/*Roberto: los paquetes que estan bajo LFS*/
                 ack[DSEQ] = inbuf[DSEQ];
                 ack[DRET] = inbuf[DRET];
                 
@@ -401,7 +401,7 @@ static void *Drcvr(void *ppp) {
                     int seqAux = (ReciveBuff.LASTSENDINBOX + getDiff(LFR,inbuf[DSEQ])) % RWS;
                     wReciveBuff(inbuf, cnt, seqAux);                    
                 }
-                while(ReciveBuff.ack[(ReciveBuff.LASTSENDINBOX+1)%RWS] == 1)
+                while(ReciveBuff.ack[(ReciveBuff.LASTSENDINBOX+1)%RWS] == 1)/*Roberto: actualizar la ventana*/
                 {
                     putbox(connection.rbox, ReciveBuff.pending_buf[(ReciveBuff.LASTSENDINBOX+1)%RWS] + DHDR, ReciveBuff.pending_sz[(ReciveBuff.LASTSENDINBOX+1)%RWS]-DHDR);
                     LFR = (LFR + 1) % SEQSIZE;
