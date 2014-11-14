@@ -74,6 +74,7 @@ struct {
     double sentTime[SWS]; /* David: tiempo de envío de cada paquete */
     unsigned char LASTSENDINBOX; /* David: índice que indica posición de último paquete enviado en la ventana */
     int FastRetransmit; /* David: variable estado de Fast Retransmit */
+    int state;                           /* FREE, CONNECTED, CLOSED */
 } BackUp;
 
 struct{
@@ -107,6 +108,12 @@ int seqIsHeigher(int seqBuffPackage, int seqAKG)
     return seqBuffPackage <= seqAKG;
 }
 
+int seqIsHeigherAux(int seqBuffPackage, int seqAKG)
+{
+    if(seqAKG < 99 && seqBuffPackage > 156)
+        seqAKG += 256;
+    return seqBuffPackage <= seqAKG;
+}
 
 /* retorna hora actual */
 double Now() {
@@ -179,6 +186,7 @@ int init_connection(int id, double rtt,double timeRef, double timeNow) { /* Davi
         BackUp.ack[i] = 1;
         BackUp.timeout[i] = Now() + 1000;
     }
+    BackUp.state = FREE;
     
     for(i = 0; i < RWS; i++)
     {
@@ -286,6 +294,13 @@ void Dclose(int cl) {
 
     close_bufbox(connection.wbox);
     close_bufbox(connection.rbox);
+    /*
+     void del_connection() {
+    delete_bufbox(connection.wbox);
+    delete_bufbox(connection.rbox);
+    connection.state = FREE;
+}
+     */
 }
 
 /*
@@ -329,6 +344,9 @@ static void *Drcvr(void *ppp) {
 	    /*connection.expected_seq = (connection.expected_seq+1)%2;*/
 	    connection.state = CLOSED;
 	    Dclose(cl);
+            if(Data_debug)
+                fprintf(stderr, "cierro la conexion\n");
+            
 	}
 	else if(inbuf[DTYPE] == ACK && connection.state != FREE	&& connection.expecting_ack && seqIsHeigher( LAR + 1,inbuf[DSEQ]) && seqIsHeigher(inbuf[DSEQ],LFS) )
         {
@@ -364,7 +382,7 @@ static void *Drcvr(void *ppp) {
 	else if(inbuf[DTYPE] == DATA && connection.state == CONNECTED) 
         {
 	    if(Data_debug) 
-                fprintf(stderr, "rcv: DATA: %d, seq=%d, expected=%d\n", inbuf[DID], inbuf[DSEQ], /*connection.expected_seq*/LFS);
+                fprintf(stderr, "rcv: DATA: %d, seq=%d, expected=%d-%d\n", inbuf[DID], inbuf[DSEQ], /*connection.expected_seq*/LFR,LAF);
 	    if( boxsz(connection.rbox) >= MAX_QUEUE ) 
             { /* No tengo espacio */
 		pthread_mutex_unlock(&Dlock);
@@ -376,10 +394,12 @@ static void *Drcvr(void *ppp) {
 	    ack[DTYPE] = ACK;
 	    
 
-            if(!seqIsHeigher(inbuf[DSEQ] ,LAF))/*Roberto: para los paqeutes que estan sobre la ventan*/
+            if(!seqIsHeigherAux(inbuf[DSEQ] ,LAF))/*Roberto: para los paqeutes que estan sobre la ventan*/
             {
                 ack[DSEQ] = LFR;
                 ack[DRET] = inbuf[DRET];
+                if(Data_debug) 
+                    fprintf(stderr, "rcv: DATA: TO BIG\n");
                 if(send(Dsock, ack, DHDR, 0) <0)
                     perror("sendack");
             }
@@ -469,7 +489,6 @@ static void *Dsender(void *ppp) {
 	/* Revisar clientes: timeouts y datos entrantes */
 
         if(connection.state == FREE) continue;
-        if(connection.state == CLOSED) break;
 
         if( BackUp.timeout[(BackUp.LASTSENDINBOX + 1)%SWS] < Now() ) 
         { /* retransmitir */ /* David: basta timeout del primer paquete */
@@ -501,7 +520,7 @@ static void *Dsender(void *ppp) {
 
         }
 
-        if(boxsz(connection.wbox) != 0) 
+        if(boxsz(connection.wbox) != 0 && BackUp.state != CLOSE) 
         { /* && !connection.expecting_ack) */
 /*
             Hay un buffer para mi para enviar
@@ -526,9 +545,10 @@ static void *Dsender(void *ppp) {
                    if(Data_debug) 
                        fprintf(stderr, "sending EOF\n");
                    connection.state = CLOSED;
+                   BackUp.state = CLOSED;
                    connection.pending_buf[DTYPE]=CLOSE;
                    connection.pending_sz = 0;
-                   break;
+                   connection.expecting_ack = 0;
                 }
                 else 
                 {
