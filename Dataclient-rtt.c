@@ -21,8 +21,8 @@
 #define MIN_TIMEOUT 0.005 /* Roberto: cota inferior timeout */
 #define MAX_TIMEOUT 3.0 /* Roberto: cota superior timeout */
 #define SWS 50 /* David: tamaño de ventana de envío */
-#define RWS 50 /* David: tamaño de ventana de envío */
-#define SEQSIZE 256 /*Roberto: tamño de la secuencia*/
+#define RWS 50 /* David: tamaño de ventana de recepción */
+#define SEQSIZE 256 /* Roberto: tamaño de la secuencia*/
 
 /* Version con threads rdr y sender
  * Implementa Stop and Wait sin seqn, falla frente a algunos errores
@@ -37,9 +37,8 @@ static int Dsock = -1;
 static pthread_mutex_t Dlock;
 static pthread_cond_t  Dcond;
 static pthread_t Drcvr_pid, Dsender_pid;
-static unsigned char ack[DHDR] = {0, ACK, 0};
-double T1, T2; /* David: variables globales para calcular RTTs */
-int retrans = 0; /* David: 0 si no se ha retransmitido, 1 lo contrario */
+static unsigned char ack[DHDR] = {0, ACK, 0, 0}; /* David: se agrega un byte para contar retransmisiones */
+double rcvdTime; /* David: tiempo de recepción para calcular RTTs */
 char unsigned LAR = -1, LFS = 0; /* David: LAR y LFS de Go-back-N . Roberto: Se inicializa en -1 para que la promera vez se haga 0*/
 char unsigned LAF = 50, LFR = 0; /*Roberto: valores para las ventanas*/
 
@@ -65,7 +64,7 @@ struct {
     int rtt_idx;			 /* David: indicador de rtt a actualizar */
 } connection;
 
-/* David: estructura que almacena datos en caso de tener que retransmitir */
+/* David: estructura que almacena datos en caso de tener que retransmitir para ventana de sender y de receiver */
 struct {
     unsigned char pending_buf[SWS][BUF_SIZE]; /* David: almacenamiento de paquetes */
     int pending_sz[SWS]; /* David: tamaño de paquetes */
@@ -83,6 +82,7 @@ struct{
     int ack[RWS]; /* David: cuenta cuántos ACKs de un paquete han llegado */
     unsigned char LASTSENDINBOX; /* David: índice que indica posición de último paquete enviado en la ventana */
 }ReciveBuff;
+
 /* Funciones utilitarias */
 
 /* David: RTT promedio de la ventana */
@@ -101,18 +101,12 @@ double getRTT() {
     return sum;
 }
 
-int seqIsHeigher(int seqBuffPackage, int seqAKG)
+/* David: compara dos números de secuencia, retornando A<=B */
+int seqIsHeigher(int seqBuffPackage, int seqACK)
 {
-    if(seqAKG < 49 && seqBuffPackage > 150)
-        seqAKG += 256;
-    return seqBuffPackage <= seqAKG;
-}
-
-int seqIsHeigherAux(int seqBuffPackage, int seqAKG)
-{
-    if(seqAKG < 99 && seqBuffPackage > 156)
-        seqAKG += 256;
-    return seqBuffPackage <= seqAKG;
+    if(seqACK < 49 && seqBuffPackage > 206)
+        seqACK += 256;
+    return seqBuffPackage <= seqACK;
 }
 
 /* retorna hora actual */
@@ -132,29 +126,31 @@ double Now() {
 
     return(tt.tv_sec+1e-9*tt.tv_nsec);
 }
-/*Roberto: diferencia entre dos puntos*/
 
-int getDiff(int seqBuffPackage, int seqAKG)
+/* Roberto: diferencia entre dos puntos en cuanto a números de secuencia */
+int getDiff(int seqBuffPackage, int seqACK)
 {
-    if(seqAKG < 49 && seqBuffPackage > 150)
-        seqAKG += 256;
-    return seqAKG - seqBuffPackage ;
+    if(seqACK < 49 && seqBuffPackage > 206)
+        seqACK += 256;
+    return seqACK - seqBuffPackage;
 }
+
 /* David: almacenar paquetes para posible retransmisión en Go-back-N */
 void wBackUp(unsigned char *pending_buf, int pending_sz, int index) 
 {
     BackUp.sentTime[index] = Now(); /* David: se marca tiempo de envío */
-    memcpy(BackUp.pending_buf[index],pending_buf,pending_sz + DHDR);/*Robert: strcopy no hacia bn su trabajo*/
+    memcpy(BackUp.pending_buf[index],pending_buf,pending_sz + DHDR); /* Roberto: strcopy no hacia bien su trabajo */
     BackUp.pending_sz[index] = pending_sz;
     BackUp.ack[index] = 0;
     BackUp.timeout[index] = BackUp.sentTime[index] + getRTT()*1.1;
 }
-/*Roberto: para meter las cosas al buff de llegada*/
+
+/* Roberto: para meter las cosas al buff de llegada */
 void wReciveBuff(unsigned char *pending_buf, int pending_sz, int index) 
 {
     if(ReciveBuff.ack[index] == 0)
     {
-        memcpy(ReciveBuff.pending_buf[index],pending_buf,pending_sz + DHDR);/*Robert: strcopy no hacia bn su trabajo*/
+        memcpy(ReciveBuff.pending_buf[index],pending_buf,pending_sz + DHDR); /* Roberto: strcopy no hacia bien su trabajo */
         ReciveBuff.pending_sz[index] = pending_sz;
         ReciveBuff.ack[index] = 1;
     }
@@ -174,10 +170,10 @@ int init_connection(int id, double rtt,double timeRef, double timeNow) { /* Davi
     /*connection.expected_seq = 1;
     connection.expected_ack = 0;*/
     connection.id = id;
-    connection.timeRef = timeRef;/*Roberto: se setea la primera referencia*/
+    connection.timeRef = timeRef; /* Roberto: se setea la primera referencia */
     for(i=0; i<SIZE_RTT; i++) { /* David: se inicializa arreglo de RTTs */
 	connection.rtt[i] = rtt;
-        connection.rtt_time[i] = timeNow;/*Se agregan los primeros tiempos*/
+        connection.rtt_time[i] = timeNow; /* Roberto: Se agregan los primeros tiempos */
     }
     connection.rtt_idx = 0; /* David: se inicializa indicador de rtt a actualizar en 0 */
 
@@ -222,6 +218,7 @@ int Dconnect(char *server, char *port) {
     int s, cl, i;
     struct sigaction new, old;
     unsigned char inbuf[DHDR], outbuf[DHDR];
+    double t1, t2; /* David: variables que indican tiempo de envío y de recepción para cálculo inicial de RTT */
 
     if(Dsock != -1) return -1;
 
@@ -237,15 +234,15 @@ int Dconnect(char *server, char *port) {
     outbuf[DTYPE] = CONNECT;
     outbuf[DID] = 0;
     outbuf[DSEQ] = 0;
-    outbuf[DRET] = 0;
+    outbuf[DRET] = 1;
     int debugV;
     for(i=0; i < RETRIES; i++) {
-	T1 = Now(); /* David: se inicia conteo */
+	t1 = Now(); /* David: se inicia conteo */
         send(s, outbuf, DHDR, 0);
 	alarm(INTTIMEOUT);
 	if((debugV = recv(s, inbuf, DHDR, 0)) != DHDR) /*robert: revisar bien esto*/
             continue;
-	T2 = Now(); /* David: se finaliza conteo */
+	t2 = Now(); /* David: se finaliza conteo */
 	if(Data_debug) fprintf(stderr, "recibo: %c, %d\n", inbuf[DTYPE], inbuf[DID]);
 	alarm(0);
 	if(inbuf[DTYPE] != ACK || inbuf[DSEQ] != 0) continue;
@@ -257,9 +254,9 @@ int Dconnect(char *server, char *port) {
 	fprintf(stderr, "no pude conectarme\n");
 	return -1;
     }
-fprintf(stderr, "conectado con id=%d\n", cl);
-    printf("RTT calculado en inicio de conexión: %f\n",T2-T1);
-    init_connection(cl,T2-T1,T1,T2); /* David: se pasa rtt=T2-T1 como parámetro, Robeto: y T1,T2, para el calculo de los pesos */
+    fprintf(stderr, "conectado con id=%d\n", cl);
+    printf("RTT calculado en inicio de conexión: %f\n",t2-t1);
+    init_connection(cl,t2-t1,t1,t2); /* David: se pasa rtt=t2-t1 como parámetro, Robeto: y t1,t2, para el calculo de los pesos */
     Init_Dlayer(s); /* Inicializa y crea threads */
     return cl;
 }
@@ -317,7 +314,7 @@ static void *Drcvr(void *ppp) {
 
 /* Recibo paquete desde el socket */
     while((cnt=recv(Dsock, inbuf, BUF_SIZE, 0)) > 0) {
-	T2 = Now(); /* David: tiempo de recepción */
+	rcvdTime = Now(); /* David: tiempo de recepción */
    	if(Data_debug)
 	    fprintf(stderr, "recv: id=%d, type=%c, seq=%d\n", inbuf[DID], inbuf[DTYPE], inbuf[DSEQ]);
 	if(cnt < DHDR) continue;
@@ -334,10 +331,11 @@ static void *Drcvr(void *ppp) {
 	    ack[DID] = cl;
 	    ack[DTYPE] = ACK;
 	    ack[DSEQ] = inbuf[DSEQ];
+	    ack[DRET] = inbuf[DRET];
 	    if(send(Dsock, ack, DHDR, 0) < 0) {
 		perror("send"); exit(2);
 	    }
-	    if(inbuf[DSEQ] != LFS/*connection.expected_seq*/) {
+	    if(inbuf[DSEQ] != LFR+1/*connection.expected_seq*/) { /* David: no entiendo esta condición */
 		pthread_mutex_unlock(&Dlock);
 		continue;
 	    }
@@ -354,7 +352,7 @@ static void *Drcvr(void *ppp) {
             int cont;
             for (cont = 1;  cont <= SWS; cont++)
             {
-                int index = (BackUp.LASTSENDINBOX + cont ) % 50;
+                int index = (BackUp.LASTSENDINBOX + cont ) % SWS;
                 
                 if(BackUp.pending_buf[index][DSEQ] == inbuf[DSEQ])
                 {
@@ -362,14 +360,20 @@ static void *Drcvr(void *ppp) {
                     if(BackUp.pending_buf[index][DRET] == inbuf[DRET]) 
                     { /* Si no hay retransmisión */
                         connection.timeRef = connection.rtt_time[connection.rtt_idx];/* Roberto: se cambia la referencia al valor que se esta lledo*/
-                        connection.rtt_time[connection.rtt_idx] = T2; /* Roberto: se pone el tiempo en que fue recibida la respuesta*/
-                        connection.rtt[connection.rtt_idx] = T2-T1; /* David: guardamos nuevo RTT */
+                        connection.rtt_time[connection.rtt_idx] = rcvdTime; /* Roberto: se pone el tiempo en que fue recibida la respuesta*/
+                        connection.rtt[connection.rtt_idx] = rcvdTime - BackUp.sentTime[index]; /* David: guardamos nuevo RTT */
                         connection.rtt_idx = (connection.rtt_idx+1)%SIZE_RTT; /* David: modificamos a posición de siguiente RTT a actualizar */
                     }
 
-                    BackUp.ack[index] = 1;
+                    BackUp.ack[index]++; /* David: para contar los dups */
                     if(Data_debug)
                         fprintf(stderr, "recv ACK id=%d, seq=%d\n", cl, inbuf[DSEQ]);
+
+		    /* David: se corre la ventana de envío */
+                    if(inbuf[DSEQ] == LAR + 1) {
+                        LAR++;
+
+
                     break;
                 }
             }
@@ -392,44 +396,48 @@ static void *Drcvr(void *ppp) {
             
 	    ack[DID] = cl;
 	    ack[DTYPE] = ACK;
-	    
+	    ack[DRET] = inbuf[DRET];
 
-            if(!seqIsHeigherAux(inbuf[DSEQ] ,LAF))/*Roberto: para los paqeutes que estan sobre la ventan*/
+            if(!seqIsHeigherAux(inbuf[DSEQ] ,LAF)) /* Roberto: para los paquetes que estan sobre la ventana */
             {
                 ack[DSEQ] = LFR;
-                ack[DRET] = inbuf[DRET];
-                if(Data_debug) 
-                    fprintf(stderr, "rcv: DATA: TO BIG\n");
+
                 if(send(Dsock, ack, DHDR, 0) <0)
                     perror("sendack");
             }
             
             else
-            {/*Roberto: los paquetes que estan bajo LFS*/
+            { /* Roberto: los paquetes que estan bajo LAF */
                 ack[DSEQ] = inbuf[DSEQ];
-                ack[DRET] = inbuf[DRET];
-                
-                if(Data_debug) 
-                    fprintf(stderr, "Enviando ACK %d, seq=%d\n", ack[DID], ack[DSEQ]);
-
-                if(send(Dsock, ack, DHDR, 0) <0)
-                    perror("sendack");
 
             /* enviar a la cola */
-                if(seqIsHeigher(LFR+1, inbuf[DSEQ]))/*Roberto: ver si esta dentro de la ventana*/
+                if(seqIsHeigher(LFR+1, inbuf[DSEQ])) /* Roberto: ver si esta dentro de la ventana */
                 {
                     int seqAux = (ReciveBuff.LASTSENDINBOX + getDiff(LFR,inbuf[DSEQ])) % RWS;
                     wReciveBuff(inbuf, cnt, seqAux);                    
                 }
-                while(ReciveBuff.ack[(ReciveBuff.LASTSENDINBOX+1)%RWS] == 1)/*Roberto: actualizar la ventana*/
-                {
+
+		if(inbuf[DSEQ] == LFR + 1) {
+		    LFR++;
+		    LAF = LFR + RWS;
+		}
+
+		/* David: eliminaría lo comentado a continuación */
+                // while(ReciveBuff.ack[(ReciveBuff.LASTSENDINBOX+1)%RWS] == 1)/*Roberto: actualizar la ventana*/
+                /*{
                     putbox(connection.rbox, ReciveBuff.pending_buf[(ReciveBuff.LASTSENDINBOX+1)%RWS] + DHDR, ReciveBuff.pending_sz[(ReciveBuff.LASTSENDINBOX+1)%RWS]-DHDR);
                     LFR = (LFR + 1) % SEQSIZE;
                     LAF = (LAF + 1) % SEQSIZE;
                     ReciveBuff.LASTSENDINBOX = (ReciveBuff.LASTSENDINBOX+1) % RWS;
                     ReciveBuff.ack[ReciveBuff.LASTSENDINBOX] = 0;
-                }
+                } */
             }
+
+	    if(Data_debug) 
+                    fprintf(stderr, "Enviando ACK %d, seq=%d\n", ack[DID], ack[DSEQ]);
+
+            if(send(Dsock, ack, DHDR, 0) <0)
+                    perror("sendack");
         }
 	else if(Data_debug ) {
 	    fprintf(stderr, "descarto paquete entrante: t=%c, id=%d, seq=%d , LAR=%d, LFS=%d\n", inbuf[DTYPE], inbuf[DID],inbuf[DSEQ],LAR,LFS);
@@ -498,7 +506,7 @@ static void *Dsender(void *ppp) {
                     int idx = (k+BackUp.LASTSENDINBOX)%SWS;
                     if( BackUp.timeout[idx] < Now() ) 
                     {                          
-                        if( !BackUp.ack[idx] ) 
+                        if( BackUp.ack[idx] != 0 ) 
                         {
                             if(Data_debug) 
                                 fprintf(stderr, "TIMEOUT\n");/*Roberto: Lo corri para aca, para que no de mala info*/
