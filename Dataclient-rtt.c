@@ -109,6 +109,13 @@ int seqIsHeigher(int seqBuffPackage, int seqACK)
     return seqBuffPackage <= seqACK;
 }
 
+int seqIsHeigherAux(int seqBuffPackage, int seqACK)
+{
+    if(seqACK < 99 && seqBuffPackage > 156)
+	seqACK += 256;
+    return seqBuffPackage <= seqACK;
+}
+
 /* retorna hora actual */
 double Now() {
     struct timespec tt;
@@ -370,7 +377,7 @@ static void *Drcvr(void *ppp) {
                         fprintf(stderr, "recv ACK id=%d, seq=%d\n", cl, inbuf[DSEQ]);
 
 		    /* David: se corre la ventana de envío */
-                    if(inbuf[DSEQ] == LAR + 1) {
+                    if(inbuf[DSEQ] == LAR + 1)
                         LAR++;
 
 
@@ -536,7 +543,6 @@ static void *Dsender(void *ppp) {
 */
             while(boxsz(connection.wbox) != 0)
             {
-                retrans = 0; /*David: es primer envío */
                 if(BackUp.ack[(BackUp.LASTSENDINBOX + 1)%SWS] == 0)
                     break;
 
@@ -565,17 +571,16 @@ static void *Dsender(void *ppp) {
                    connection.pending_buf[DTYPE]=DATA;
                 }
 
-                T1 = Now(); /* David: tiempo inicial primer envío */
+                BackUp.LASTSENDINBOX = (BackUp.LASTSENDINBOX + 1) % SWS;
+		BackUp.sentTime[BackUp.LASTSENDINBOX] = Now(); /* David: tiempo inicial primer envío */
 
                 send(Dsock, connection.pending_buf, DHDR+connection.pending_sz, 0);
 
-                BackUp.LASTSENDINBOX = (BackUp.LASTSENDINBOX + 1) % SWS;
-                LAR = BackUp.pending_buf[BackUp.LASTSENDINBOX][DSEQ];
                 wBackUp(connection.pending_buf, connection.pending_sz, BackUp.LASTSENDINBOX);
 
                 connection.expecting_ack = 1;
                 /*connection.timeout = Now() + getRTT()*1.1;*/
-                BackUp.timeout[BackUp.LASTSENDINBOX] = Now() + getRTT()*1.1;
+                BackUp.timeout[BackUp.LASTSENDINBOX] = BackUp.sentTime[BackUp.LASTSENDINBOX] + getRTT()*1.1;
                 connection.retries = 0;
             }
         }
