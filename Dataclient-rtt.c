@@ -39,7 +39,7 @@ static pthread_cond_t  Dcond;
 static pthread_t Drcvr_pid, Dsender_pid;
 static unsigned char ack[DHDR] = {0, ACK, 0, 0}; /* David: se agrega un byte para contar retransmisiones */
 double rcvdTime; /* David: tiempo de recepción para calcular RTTs */
-char unsigned LAR = -1, LFS = 0; /* David: LAR y LFS de Go-back-N . Roberto: Se inicializa en -1 para que la promera vez se haga 0*/
+char unsigned LAR = -1, LFS = -1; /* David: LAR y LFS de Go-back-N . Roberto: Se inicializa en -1 para que la promera vez se haga 0*/
 char unsigned LAF = 50, LFR = 0; /*Roberto: valores para las ventanas*/
 
 static void *Dsender(void *ppp);
@@ -106,7 +106,7 @@ int seqIsHeigher(int seqBuffPackage, int seqACK)
 {
     if(seqACK < 49 && seqBuffPackage > 206)
         seqACK += 256;
-    return seqBuffPackage <= seqACK;
+    return seqBuffPackage < seqACK;
 }
 
 int seqIsHeigherAux(int seqBuffPackage, int seqACK)
@@ -353,7 +353,7 @@ static void *Drcvr(void *ppp) {
                 fprintf(stderr, "cierro la conexion\n");
             
 	}
-	else if(inbuf[DTYPE] == ACK && connection.state != FREE	&& connection.expecting_ack && seqIsHeigher( LAR + 1,inbuf[DSEQ]) && seqIsHeigher(inbuf[DSEQ],LFS) )
+	else if(inbuf[DTYPE] == ACK && connection.state != FREE	&& connection.expecting_ack && seqIsHeigher( LAR,inbuf[DSEQ]) && seqIsHeigher(inbuf[DSEQ],LFS+1) )
         {
     	    //connection.expecting_ack = 0;
             int cont;
@@ -363,6 +363,7 @@ static void *Drcvr(void *ppp) {
                 
                 if(BackUp.pending_buf[index][DSEQ] == inbuf[DSEQ])
                 {
+
                     /* David: medimos RTT cuando recibimos ACK */
                     if(BackUp.pending_buf[index][DRET] == inbuf[DRET]) 
                     { /* Si no hay retransmisión */
@@ -377,9 +378,8 @@ static void *Drcvr(void *ppp) {
                         fprintf(stderr, "recv ACK id=%d, seq=%d\n", cl, inbuf[DSEQ]);
 
 		    /* David: se corre la ventana de envío */
-                    if(inbuf[DSEQ] == LAR + 1)
-                        LAR++;
-
+                    if(inbuf[DSEQ] == (LAR + 1)%SEQSIZE)
+                        LAR = (LAR + 1)%SEQSIZE;
 
                     break;
                 }
@@ -405,7 +405,7 @@ static void *Drcvr(void *ppp) {
 	    ack[DTYPE] = ACK;
 	    ack[DRET] = inbuf[DRET];
 
-            if(!seqIsHeigherAux(inbuf[DSEQ] ,LAF)) /* Roberto: para los paquetes que estan sobre la ventana */
+            if(seqIsHeigher( LAF, inbuf[DSEQ] )) /* Roberto: para los paquetes que estan sobre la ventana */
             {
                 ack[DSEQ] = LFR;
 
@@ -418,15 +418,15 @@ static void *Drcvr(void *ppp) {
                 ack[DSEQ] = inbuf[DSEQ];
 
             /* enviar a la cola */
-                if(seqIsHeigher(LFR+1, inbuf[DSEQ])) /* Roberto: ver si esta dentro de la ventana */
+                if(seqIsHeigher(LFR, inbuf[DSEQ])) /* Roberto: ver si esta dentro de la ventana */
                 {
                     int seqAux = (ReciveBuff.LASTSENDINBOX + getDiff(LFR,inbuf[DSEQ])) % RWS;
                     wReciveBuff(inbuf, cnt, seqAux);                    
                 }
 
-		if(inbuf[DSEQ] == LFR + 1) {
-		    LFR++;
-		    LAF = LFR + RWS;
+		if(inbuf[DSEQ] == (LFR + 1)%SEQSIZE) {
+		    LFR = (LFR + 1)%SEQSIZE;
+		    LAF = (LFR + RWS)%SEQSIZE;
 		}
 
 		/* David: eliminaría lo comentado a continuación */
@@ -551,7 +551,7 @@ static void *Dsender(void *ppp) {
                 //connection.expected_ack = (connection.expected_ack+1)%2;
 
                 LFS = (LFS + 1) % SEQSIZE;
-                connection.pending_buf[DSEQ]=LFS;
+                connection.pending_buf[DSEQ] = LFS;
                 connection.pending_buf[DRET] = 1;
 
                 if(connection.pending_sz == -1) 
@@ -573,8 +573,12 @@ static void *Dsender(void *ppp) {
 
                 BackUp.LASTSENDINBOX = (BackUp.LASTSENDINBOX + 1) % SWS;
 		BackUp.sentTime[BackUp.LASTSENDINBOX] = Now(); /* David: tiempo inicial primer envío */
+		BackUp.ack[BackUp.LASTSENDINBOX] = 0;
 
-                send(Dsock, connection.pending_buf, DHDR+connection.pending_sz, 0);
+                if(send(Dsock, connection.pending_buf, DHDR+connection.pending_sz, 0) < 0) {
+		    perror("no se pudo enviar el paquete\n");
+		    exit(1);
+		}
 
                 wBackUp(connection.pending_buf, connection.pending_sz, BackUp.LASTSENDINBOX);
 
