@@ -39,8 +39,8 @@ static pthread_cond_t  Dcond;
 static pthread_t Drcvr_pid, Dsender_pid;
 static unsigned char ack[DHDR] = {0, ACK, 0, 0}; /* David: se agrega un byte para contar retransmisiones */
 double rcvdTime; /* David: tiempo de recepción para calcular RTTs */
-char unsigned LAR = -1, LFS = -1; /* David: LAR y LFS de Go-back-N . Roberto: Se inicializa en -1 para que la promera vez se haga 0*/
-char unsigned LAF = 50, LFR = 0; /*Roberto: valores para las ventanas*/
+char unsigned LAR = -1, LFS = -1; /* David: LAR y LFS de Go-back-N . Roberto: Se inicializa en -1 para que la promera vez se haga 0 */
+char unsigned LAF = 50, LFR = -1; /* Roberto: valores para las ventanas */
 
 static void *Dsender(void *ppp);
 static void *Drcvr(void *ppp);
@@ -104,7 +104,7 @@ double getRTT() {
 /* David: compara dos números de secuencia, retornando A<=B */
 int seqIsHeigher(int seqBuffPackage, int seqACK)
 {
-    if(seqACK < 49 && seqBuffPackage > 206)
+    if(seqACK < 50 && seqBuffPackage > 200)
         seqACK += 256;
     return seqBuffPackage < seqACK;
 }
@@ -375,7 +375,7 @@ static void *Drcvr(void *ppp) {
 
                     BackUp.ack[index]++; /* David: para contar los dups */
                     if(Data_debug)
-                        fprintf(stderr, "recv ACK id=%d, seq=%d\n", cl, inbuf[DSEQ]);
+                        fprintf(stderr, "recv ACK id=%d, seq=%d, LAR=%d, LFS=%d\n", cl, inbuf[DSEQ], LAR, LFS);
 
 		    /* David: se corre la ventana de envío */
                     if(inbuf[DSEQ] == (LAR + 1)%SEQSIZE)
@@ -393,7 +393,7 @@ static void *Drcvr(void *ppp) {
 	else if(inbuf[DTYPE] == DATA && connection.state == CONNECTED) 
         {
 	    if(Data_debug) 
-                fprintf(stderr, "rcv: DATA: %d, seq=%d, expected=%d-%d\n", inbuf[DID], inbuf[DSEQ], /*connection.expected_seq*/LFR,LAF);
+                fprintf(stderr, "rcv: DATA: %d, seq=%d, LFR=%d, LAF=%d\n", inbuf[DID], inbuf[DSEQ], /*connection.expected_seq*/LFR,LAF);
 	    if( boxsz(connection.rbox) >= MAX_QUEUE ) 
             { /* No tengo espacio */
 		pthread_mutex_unlock(&Dlock);
@@ -423,25 +423,25 @@ static void *Drcvr(void *ppp) {
                     int seqAux = (ReciveBuff.LASTSENDINBOX + getDiff(LFR,inbuf[DSEQ])) % RWS;
                     wReciveBuff(inbuf, cnt, seqAux);                    
                 }
-
+/*
 		if(inbuf[DSEQ] == (LFR + 1)%SEQSIZE) {
 		    LFR = (LFR + 1)%SEQSIZE;
 		    LAF = (LFR + RWS)%SEQSIZE;
 		}
-
+*/
 		/* David: eliminaría lo comentado a continuación */
-                // while(ReciveBuff.ack[(ReciveBuff.LASTSENDINBOX+1)%RWS] == 1)/*Roberto: actualizar la ventana*/
-                /*{
+                while(ReciveBuff.ack[(ReciveBuff.LASTSENDINBOX+1)%RWS] == 1)/*Roberto: actualizar la ventana*/
+                {
                     putbox(connection.rbox, ReciveBuff.pending_buf[(ReciveBuff.LASTSENDINBOX+1)%RWS] + DHDR, ReciveBuff.pending_sz[(ReciveBuff.LASTSENDINBOX+1)%RWS]-DHDR);
                     LFR = (LFR + 1) % SEQSIZE;
                     LAF = (LAF + 1) % SEQSIZE;
                     ReciveBuff.LASTSENDINBOX = (ReciveBuff.LASTSENDINBOX+1) % RWS;
                     ReciveBuff.ack[ReciveBuff.LASTSENDINBOX] = 0;
-                } */
+                }
             }
 
 	    if(Data_debug) 
-                    fprintf(stderr, "Enviando ACK %d, seq=%d\n", ack[DID], ack[DSEQ]);
+                    fprintf(stderr, "Enviando ACK %d, seq=%d, LFR=%d, LAF=%d\n", ack[DID], ack[DSEQ], LFR, LAF);
 
             if(send(Dsock, ack, DHDR, 0) <0)
                     perror("sendack");
@@ -513,7 +513,7 @@ static void *Dsender(void *ppp) {
                     int idx = (k+BackUp.LASTSENDINBOX)%SWS;
                     if( BackUp.timeout[idx] < Now() ) 
                     {                          
-                        if( BackUp.ack[idx] != 0 ) 
+                        if( BackUp.ack[idx] == 0 ) 
                         {
                             if(Data_debug) 
                                 fprintf(stderr, "TIMEOUT\n");/*Roberto: Lo corri para aca, para que no de mala info*/
@@ -530,6 +530,8 @@ static void *Dsender(void *ppp) {
                             if(Data_debug)
                                 fprintf(stderr, "Re-send DATA %d, seq=%d\n", BackUp.pending_buf[idx][DID], BackUp.pending_buf[idx][DSEQ]);
                         }
+			else
+			    break;
                     }
             }
 
