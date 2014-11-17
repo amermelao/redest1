@@ -381,7 +381,7 @@ static void *Drcvr(void *ppp) {
                     if(inbuf[DSEQ] == (LAR + 1)%SEQSIZE)
                         LAR = (LAR + 1)%SEQSIZE;
 
-                    break;
+                    //break;
                 }
             }
 	    if(connection.state == CLOSED) {
@@ -530,8 +530,7 @@ static void *Dsender(void *ppp) {
                             if(Data_debug)
                                 fprintf(stderr, "Re-send DATA %d, seq=%d\n", BackUp.pending_buf[idx][DID], BackUp.pending_buf[idx][DSEQ]);
                         }
-			else
-			    break;
+			break;
                     }
             }
 
