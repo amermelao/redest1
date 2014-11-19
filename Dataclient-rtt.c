@@ -2,6 +2,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <errno.h>
 #include <time.h>
 #include <sys/time.h>
 #ifdef __MACH__
@@ -12,35 +13,31 @@
 #include <sys/socket.h>
 #include <signal.h>
 #include <string.h>
+#include <math.h>
 #include "jsocket6.4.h"
 #include "bufbox.h"
-#include "Data-seqn.h"
+#include "Data-rtt.h"
 
 #define MAX_QUEUE 100 /* buffers en boxes */
-#define SIZE_RTT 10 /* David: cantidad de RTTs a promediar */
-#define MIN_TIMEOUT 0.005 /* Roberto: cota inferior timeout */
-#define MAX_TIMEOUT 3.0 /* Roberto: cota superior timeout */
-#define SWS 50 /* David: tamaño de ventana de envío */
-#define RWS 50 /* David: tamaño de ventana de recepción */
-#define SEQSIZE 256 /* Roberto: tamaño de la secuencia*/
 
-/* Version con threads rdr y sender
- * Implementa Stop and Wait sin seqn, falla frente a algunos errores
- * Modificado para incluir un número de secuencia
+/* T2: Version con threads
+ * Implementa Go Back N con threads, 
+ * 256 números de secuencia (0-255)
+ * WIN_SZ buffers en enviador, 1 buffer en receptor
+ * WIN_SZ DEBE ser < 128
+ * con RTT adaptable para hacerlo mas eficiente
+ * con DCNT para aceptar ACKs retransmitidos
+ * Fast Retransmit: cuando llega un tercer ACK duplicado, hago como si fuera un timeout
  */
 
 
 int Data_debug = 0; /* para debugging */
 
-/* Variables globales del cliente */
 static int Dsock = -1;
 static pthread_mutex_t Dlock;
 static pthread_cond_t  Dcond;
 static pthread_t Drcvr_pid, Dsender_pid;
-static unsigned char ack[DHDR] = {0, ACK, 0, 0}; /* David: se agrega un byte para contar retransmisiones */
-double rcvdTime; /* David: tiempo de recepción para calcular RTTs */
-char unsigned LAR = -1, LFS = -1; /* David: LAR y LFS de Go-back-N . Roberto: Se inicializa en -1 para que la promera vez se haga 0 */
-char unsigned LAF = 50, LFR = -1; /* Roberto: valores para las ventanas */
+static unsigned char ack[DHDR] = {0, ACK, 0, 0};
 
 static void *Dsender(void *ppp);
 static void *Drcvr(void *ppp);
@@ -49,74 +46,28 @@ static void *Drcvr(void *ppp);
 #define max(a, b) (((a) > (b))?(a):(b))
 
 struct {
-    BUFBOX *rbox, *wbox; /* Cajas de comunicación con el thread "usuario" */
-    unsigned char pending_buf[BUF_SIZE]; /* buffer esperando ack */
-    int pending_sz;  			 /* tamaño buffer esperando */
-    int expecting_ack;			 /* 1: esperando ack */
-    //char unsigned expected_seq, expected_ack;    /* 0 o 1 */
-    int retries;                         /* cuantas veces he retransmitido */
-    double timeout;                      /* tiempo restante antes de retransmision */
-    int state;                           /* FREE, CONNECTED, CLOSED */
-    int id;                              /* id conexión, la asigna el servidor */
-    double rtt[SIZE_RTT];		 /* David: arreglo de RTTs históricos */
-    double rtt_time[SIZE_RTT];           /* Roberto: se agrega un arregle que almacena el tiempo en que se agrega un nuevo elemento al arreglo*/
-    double timeRef;                      /* Roberto: para tener una referencia del tiempo*/
-    int rtt_idx;			 /* David: indicador de rtt a actualizar */
+    BUFBOX *rbox, *wbox;
+    unsigned char pending_buf[WIN_SZ][BUF_SIZE];
+    int pending_sz[WIN_SZ];
+    int retries[WIN_SZ];
+    double timeout[WIN_SZ];
+    unsigned char first_w, next_w; /* window pointers */
+    unsigned char first_rw; /* David: puntero del primer paquete en ventana de recepción */
+    int full_win;                  /* signals fullwin to disambiguate when first==next */
+    unsigned char expected_seq, expected_ack, next_seq;
+    int state;
+    int id;
+    double rtt, rdev, rtimeout, stime[WIN_SZ];
+    int dup;            /* contador de DATA duplicados, para estadística */
+    int dup_acks; 	/* contador de acks duplicados */
+    int dup_ack_timeout; /* flag para anotar cuando ocurrió un fast retransmit y evitar un timeout extra */
+    int acked[WIN_SZ]; /* David: marcador de paquetes enviados confirmados (ventana de envío) */
+    int rcvd[WIN_SZ]; /* David: marcador de paquetes recibidos (ventana de recepción) */
 } connection;
-
-/* David: estructura que almacena datos en caso de tener que retransmitir para ventana de sender y de receiver */
-struct {
-    unsigned char pending_buf[SWS][BUF_SIZE]; /* David: almacenamiento de paquetes */
-    int pending_sz[SWS]; /* David: tamaño de paquetes */
-    int ack[SWS]; /* David: cuenta cuántos ACKs de un paquete han llegado */
-    double timeout[SWS]; /* David: arreglo de timeouts */
-    double sentTime[SWS]; /* David: tiempo de envío de cada paquete */
-    unsigned char LASTSENDINBOX; /* David: índice que indica posición de último paquete enviado en la ventana */
-    int FastRetransmit; /* David: variable estado de Fast Retransmit */
-    int state;                           /* FREE, CONNECTED, CLOSED */
-} BackUp;
-
-struct{
-    unsigned char pending_buf[RWS][BUF_SIZE]; /* David: almacenamiento de paquetes */
-    int pending_sz[RWS]; /* David: tamaño de paquetes */
-    int ack[RWS]; /* David: cuenta cuántos ACKs de un paquete han llegado */
-    unsigned char LASTSENDINBOX; /* David: índice que indica posición de último paquete enviado en la ventana */
-}ReciveBuff;
 
 /* Funciones utilitarias */
 
-/* David: RTT promedio de la ventana */
-double getRTT() {
-    int i;
-    double peso;
-    double sum = 0.0;
-    double sumWeigth = 0;
-    for(i=0; i<SIZE_RTT; i++) {
-        peso = connection.rtt_time[i] - connection.timeRef;
-	sum+=(connection.rtt[i]*peso);
-        sumWeigth+=peso;
-    }
-    sum/=sumWeigth; /* Roberto: condiciones minimas y maximas de time out*/
-    sum = sum*1.1<MIN_TIMEOUT ? MIN_TIMEOUT/1.1 : (sum*1.1>MAX_TIMEOUT ? MAX_TIMEOUT/1.1 : sum);
-    return sum;
-}
-
-/* David: compara dos números de secuencia, retornando A<=B */
-int seqIsHeigher(int seqBuffPackage, int seqACK)
-{
-    if(seqACK < 50 && seqBuffPackage > 200)
-        seqACK += 256;
-    return seqBuffPackage < seqACK;
-}
-
-int seqIsHeigherAux(int seqBuffPackage, int seqACK)
-{
-    if(seqACK < 99 && seqBuffPackage > 156)
-	seqACK += 256;
-    return seqBuffPackage <= seqACK;
-}
-
-/* retorna hora actual */
+/* retorna la hora actual */
 double Now() {
     struct timespec tt;
 #ifdef __MACH__ // OS X does not have clock_gettime, use clock_get_time
@@ -134,67 +85,64 @@ double Now() {
     return(tt.tv_sec+1e-9*tt.tv_nsec);
 }
 
-/* Roberto: diferencia entre dos puntos en cuanto a números de secuencia */
-int getDiff(int seqBuffPackage, int seqACK)
-{
-    if(seqACK < 49 && seqBuffPackage > 206)
-        seqACK += 256;
-    return seqACK - seqBuffPackage;
+/* Revisa rango cíclico */
+int between(int x, int min, int max) {      /* min <= x < max */
+    if(min <= max) return (min <= x && x < max);
+    else          return (min <= x || x < max);
 }
 
-/* David: almacenar paquetes para posible retransmisión en Go-back-N */
-void wBackUp(unsigned char *pending_buf, int pending_sz, int index) 
-{
-    BackUp.sentTime[index] = Now(); /* David: se marca tiempo de envío */
-    memcpy(BackUp.pending_buf[index],pending_buf,pending_sz + DHDR); /* Roberto: strcopy no hacia bien su trabajo */
-    BackUp.pending_sz[index] = pending_sz;
-    BackUp.ack[index] = 0;
-    BackUp.timeout[index] = BackUp.sentTime[index] + getRTT()*1.1;
-}
+/* debugging ventana */
+void print_win() {
+    int p;
+    int cnt, prev;
 
-/* Roberto: para meter las cosas al buff de llegada */
-void wReciveBuff(unsigned char *pending_buf, int pending_sz, int index) 
-{
-    if(ReciveBuff.ack[index] == 0)
-    {
-        memcpy(ReciveBuff.pending_buf[index],pending_buf,pending_sz + DHDR); /* Roberto: strcopy no hacia bien su trabajo */
-        ReciveBuff.pending_sz[index] = pending_sz;
-        ReciveBuff.ack[index] = 1;
+    if(connection.first_w == connection.next_w && !connection.full_win) {
+        fprintf(stderr, "empty win\n");
+        return;
     }
+    fprintf(stderr, "win:");
+    p=connection.first_w;
+    cnt=0;
+    do {
+        cnt++;
+/* Si quieren ver TODA la ventana descomentar esta linea */
+        // fprintf(stderr, " %d/%d", connection.pending_buf[p][DSEQ], connection.pending_buf[p][DCNT]);
+        if(cnt != 1 && (prev+1)%MAX_SEQ != connection.pending_buf[p][DSEQ]) {
+            fprintf(stderr, "OJO: Out of order!\n");
+            exit(1);
+        }
+        prev = connection.pending_buf[p][DSEQ];
+        p = (p+1)%WIN_SZ;
+    } while(p != connection.next_w);
+    fprintf(stderr, " %d\n", cnt);
+    if(cnt > WIN_SZ) { fprintf(stderr, "OJO: WIN TOO BIG!\n"); exit(1);}
 }
 
 /* Inicializa estructura conexión */
-int init_connection(int id, double rtt,double timeRef, double timeNow) { /* David: se agrega 'rtt', que es el primer RTT calculado */
-    int cl, i; /* David: variable 'i' agregada */
-    pthread_t pid;
-    int *p;
+int init_connection(int id) {
+    int i;
 
     connection.state = CONNECTED;
     connection.wbox = create_bufbox(MAX_QUEUE); 
     connection.rbox = create_bufbox(MAX_QUEUE);
-    connection.pending_sz = -1;
-    connection.expecting_ack = 0;
-    /*connection.expected_seq = 1;
-    connection.expected_ack = 0;*/
+    for(i=0; i < WIN_SZ; i++) {
+        connection.pending_sz[i] = -1;
+	connection.acked[i] = 0; /* David: todavía no se reciben ACKs */
+	connection.rcvd[i] = 0; /* David: todavía no se reciben paquetes de datos */
+    }
+    connection.expected_ack = 1;
+    connection.next_seq = 1;
+    connection.expected_seq = 0;
+    connection.first_w = connection.next_w = 0;
+    connection.first_rw = 0; /* David: puntero de ventana de recepción */
+    connection.full_win = 0;
+    connection.rtt = 1.0; /* 1 s */
+    connection.rdev = 0.0;
+    connection.rtimeout = connection.rtt + connection.rdev;
+    connection.dup = 0;
+    connection.dup_acks = 0;
+    connection.dup_ack_timeout = 0;
     connection.id = id;
-    connection.timeRef = timeRef; /* Roberto: se setea la primera referencia */
-    for(i=0; i<SIZE_RTT; i++) { /* David: se inicializa arreglo de RTTs */
-	connection.rtt[i] = rtt;
-        connection.rtt_time[i] = timeNow; /* Roberto: Se agregan los primeros tiempos */
-    }
-    connection.rtt_idx = 0; /* David: se inicializa indicador de rtt a actualizar en 0 */
-
-    for(i = 0; i < SWS; i++)
-    {
-        BackUp.ack[i] = 1;
-        BackUp.timeout[i] = Now() + 1000;
-    }
-    BackUp.state = FREE;
-    
-    for(i = 0; i < RWS; i++)
-    {
-        ReciveBuff.ack[i] = 0;
-    }
     return id;
 }
 
@@ -203,6 +151,7 @@ void del_connection() {
     delete_bufbox(connection.wbox);
     delete_bufbox(connection.rbox);
     connection.state = FREE;
+fprintf(stderr, "Freeing connection %d\n", connection.id);
 }
 
 /* Función que inicializa los threads necesarios: sender y rcvr */
@@ -225,11 +174,10 @@ int Dconnect(char *server, char *port) {
     int s, cl, i;
     struct sigaction new, old;
     unsigned char inbuf[DHDR], outbuf[DHDR];
-    double t1, t2; /* David: variables que indican tiempo de envío y de recepción para cálculo inicial de RTT */
 
     if(Dsock != -1) return -1;
 
-    s = j_socket_udp_connect(server, port); /* deja "conectado" el socket UDP, puedo usar recv y send */
+    s = j_socket_udp_connect(server, port);
     if(s < 0) return s;
 
 /* inicializar conexion */
@@ -241,15 +189,12 @@ int Dconnect(char *server, char *port) {
     outbuf[DTYPE] = CONNECT;
     outbuf[DID] = 0;
     outbuf[DSEQ] = 0;
-    outbuf[DRET] = 1;
-    int debugV;
+    outbuf[DCNT] = 1;
     for(i=0; i < RETRIES; i++) {
-	t1 = Now(); /* David: se inicia conteo */
         send(s, outbuf, DHDR, 0);
+	outbuf[DCNT]++;
 	alarm(INTTIMEOUT);
-	if((debugV = recv(s, inbuf, DHDR, 0)) != DHDR) /*robert: revisar bien esto*/
-            continue;
-	t2 = Now(); /* David: se finaliza conteo */
+	if(recv(s, inbuf, DHDR, 0) != DHDR) continue;
 	if(Data_debug) fprintf(stderr, "recibo: %c, %d\n", inbuf[DTYPE], inbuf[DID]);
 	alarm(0);
 	if(inbuf[DTYPE] != ACK || inbuf[DSEQ] != 0) continue;
@@ -261,10 +206,10 @@ int Dconnect(char *server, char *port) {
 	fprintf(stderr, "no pude conectarme\n");
 	return -1;
     }
-    fprintf(stderr, "conectado con id=%d\n", cl);
-    printf("RTT calculado en inicio de conexión: %f\n",t2-t1);
-    init_connection(cl,t2-t1,t1,t2); /* David: se pasa rtt=t2-t1 como parámetro, Robeto: y t1,t2, para el calculo de los pesos */
-    Init_Dlayer(s); /* Inicializa y crea threads */
+fprintf(stderr, "conectado, id=%d\n", cl);
+    init_connection(cl);
+    connection.expected_seq = (connection.expected_seq+1)%MAX_SEQ;
+    Init_Dlayer(s); /* Inicializa y crea thread rcvr */
     return cl;
 }
 
@@ -288,23 +233,15 @@ void Dwrite(int cl, char *buf, int l) {
  * y no va a perder el signal! 
  */
     pthread_mutex_lock(&Dlock);
-    pthread_cond_signal(&Dcond); 	/* Le aviso a sender que puse datos para él en wbox */
+    pthread_cond_signal(&Dcond);	/* Le aviso a sender que puse datos para él en wbox */
     pthread_mutex_unlock(&Dlock);
 }
-
 /* cierra conexión */
 void Dclose(int cl) {
     if(connection.id != cl) return;
 
     close_bufbox(connection.wbox);
     close_bufbox(connection.rbox);
-    /*
-     void del_connection() {
-    delete_bufbox(connection.wbox);
-    delete_bufbox(connection.rbox);
-    connection.state = FREE;
-}
-     */
 }
 
 /*
@@ -318,137 +255,175 @@ static void *Drcvr(void *ppp) {
     int cl, p;
     unsigned char inbuf[BUF_SIZE];
     int found;
+    double diff;
 
-/* Recibo paquete desde el socket */
+/* No verifico que me estén inyectando datos falsos de una conexion */
     while((cnt=recv(Dsock, inbuf, BUF_SIZE, 0)) > 0) {
-	rcvdTime = Now(); /* David: tiempo de recepción */
    	if(Data_debug)
-	    fprintf(stderr, "recv: id=%d, type=%c, seq=%d\n", inbuf[DID], inbuf[DTYPE], inbuf[DSEQ]);
+	    fprintf(stderr, "recv: id=%d, type=%c, seq=%d, retries=%d\n", inbuf[DID], inbuf[DTYPE], inbuf[DSEQ], inbuf[DCNT]);
 	if(cnt < DHDR) continue;
 
 	cl = inbuf[DID];
-   	if(cl != connection.id) continue;
+	if(cl != connection.id) continue;
 
 	pthread_mutex_lock(&Dlock);
-	if(inbuf[DTYPE] == CLOSE) 
-        {
-            if(Data_debug)
-                fprintf(stderr, "recibo cierre conexión %d, envío ACK\n", cl);
-            
+
+	if(inbuf[DTYPE] == CLOSE) { /* muy parecido a DATA */
+	    if(Data_debug) fprintf(stderr, "rcv: CLOSE: %d, seq=%d, expected=%d\n\n", cl, inbuf[DSEQ], connection.expected_seq);
+
+	/* Envio ack en todos los casos */
 	    ack[DID] = cl;
 	    ack[DTYPE] = ACK;
-	    ack[DSEQ] = inbuf[DSEQ];
-	    ack[DRET] = inbuf[DRET];
-	    if(send(Dsock, ack, DHDR, 0) < 0) {
-		perror("send"); exit(2);
+            if(inbuf[DSEQ] == connection.expected_seq) {
+                ack[DSEQ] = inbuf[DSEQ];
+	        ack[DCNT] = inbuf[DCNT];
 	    }
-	    if(inbuf[DSEQ] != LFR+1/*connection.expected_seq*/) { /* David: no entiendo esta condición */
+            else {
+                ack[DSEQ] = (connection.expected_seq+MAX_SEQ-1)%MAX_SEQ;
+	        ack[DCNT] = 0; /* Ack sintético, no considerar para RTT */
+	    }
+
+	    if(Data_debug) fprintf(stderr, "Enviando CLOSE ACK %d, seq=%d\n", ack[DID], ack[DSEQ]);
+
+	    if(send(Dsock, ack, DHDR, 0) < 0) 
+		perror("sendack");
+
+	    if(inbuf[DSEQ] != connection.expected_seq) { /* ignoramos el close */
 		pthread_mutex_unlock(&Dlock);
 		continue;
 	    }
-	    /*connection.expected_seq = (connection.expected_seq+1)%2;*/
+
+            connection.expected_seq = (connection.expected_seq+1)%MAX_SEQ;
 	    connection.state = CLOSED;
+	    fprintf(stderr, "closing %d, dups=%d\n", cl, connection.dup);
 	    Dclose(cl);
-            if(Data_debug)
-                fprintf(stderr, "cierro la conexion\n");
-            
 	}
-	else if(inbuf[DTYPE] == ACK && connection.state != FREE	&& connection.expecting_ack && seqIsHeigher( LAR,inbuf[DSEQ]) && seqIsHeigher(inbuf[DSEQ],LFS+1) )
-        {
-    	    //connection.expecting_ack = 0;
-            int cont;
-            for (cont = 1;  cont <= SWS; cont++)
-            {
-                int index = (BackUp.LASTSENDINBOX + cont ) % SWS;
-                
-                if(BackUp.pending_buf[index][DSEQ] == inbuf[DSEQ])
-                {
+/* Un Ack: trabajamos para el enviador */
+	else if(inbuf[DTYPE] == ACK && connection.state != FREE
+                && between(inbuf[DSEQ], connection.expected_ack, connection.next_seq)) {
+        /* liberar buffers entre expected_ack e inbuf[DSEQ] */
 
-                    /* David: medimos RTT cuando recibimos ACK */
-                    if(BackUp.pending_buf[index][DRET] == inbuf[DRET]) 
-                    { /* Si no hay retransmisión */
-                        connection.timeRef = connection.rtt_time[connection.rtt_idx];/* Roberto: se cambia la referencia al valor que se esta lledo*/
-                        connection.rtt_time[connection.rtt_idx] = rcvdTime; /* Roberto: se pone el tiempo en que fue recibida la respuesta*/
-                        connection.rtt[connection.rtt_idx] = rcvdTime - BackUp.sentTime[index]; /* David: guardamos nuevo RTT */
-                        connection.rtt_idx = (connection.rtt_idx+1)%SIZE_RTT; /* David: modificamos a posición de siguiente RTT a actualizar */
-                    }
+		connection.dup_acks = 0;
 
-                    BackUp.ack[index]++; /* David: para contar los dups */
-                    if(Data_debug)
-                        fprintf(stderr, "recv ACK id=%d, seq=%d, LAR=%d, LFS=%d\n", cl, inbuf[DSEQ], LAR, LFS);
+	    if(Data_debug)
+		fprintf(stderr, "recv ACK id=%d, seq=%u, retries=%d\n", inbuf[DID], inbuf[DSEQ], inbuf[DCNT]);
 
-		    /* David: se corre la ventana de envío */
-                    if(inbuf[DSEQ] == (LAR + 1)%SEQSIZE)
-                        LAR = (LAR + 1)%SEQSIZE;
-
-                    //break;
-                }
+            if(connection.first_w == connection.next_w && !connection.full_win) {
+                fprintf(stderr, "OJO: ack aceptado con ventana vacia!\n");
+                exit(1);
             }
-	    if(connection.state == CLOSED) {
-		/* conexion cerrada y sin buffers pendientes */
-		del_connection();
-	    }
+            found = 0;
+            p=connection.first_w;
+            do {
+                if(connection.pending_buf[p][DSEQ] == inbuf[DSEQ]) {
+                    found = 1;
+		    connection.acked[p] = 1; /* David: marcamos la recepción del paquete */
+                    break;
+                }
+                p=(p+1)%WIN_SZ;
+            } while(p != connection.next_w);
+
+            if(!found) {
+                fprintf(stderr, "OJO: No pudo pasar: ack aceptado con ventana vacia?\n");
+                exit(1);
+            }
+	    // if(connection.retries[p] == 0) {}
+	    if(inbuf[DCNT] == connection.retries[p]) {
+	    	diff = connection.rtt-(Now()-connection.stime[p]);
+	    	connection.rtt -= diff*0.125;
+	    	connection.rdev = 0.75*connection.rdev + (fabs(diff))*0.25;
+	    	connection.rtimeout = (connection.rtt + 4*connection.rdev)*1.1;
+	    	if(connection.rtimeout < MINTIMEOUT)
+		    connection.rtimeout = MINTIMEOUT;
+	    	if(connection.rtimeout > MAXTIMEOUT)
+		    connection.rtimeout = MAXTIMEOUT;
+
+                if(Data_debug) fprintf(stderr, "rtt=%f, diff=%f, rdev=%f, setting timeout to: %f, retries = %d\n", (Now()-connection.stime[p]), diff, connection.rdev, connection.rtimeout, inbuf[DCNT]);
+	    } else if(Data_debug) fprintf(stderr, "rtt ignored, expected_retry=%d, received=%d\n", connection.retries[p], inbuf[DCNT]);
+
+            p=(p+1)%WIN_SZ;
+            connection.first_w = p;
+            connection.full_win = 0;
+            connection.expected_ack = (inbuf[DSEQ]+1)%MAX_SEQ;
+
+            if(connection.state == CLOSED &&
+               connection.first_w == connection.next_w &&
+               !connection.full_win) {
+                /* conexion cerrada y sin buffers pendientes */
+                del_connection();
+            }
 	    pthread_cond_signal(&Dcond);
 	}
-	else if(inbuf[DTYPE] == DATA && connection.state == CONNECTED) 
-        {
-	    if(Data_debug) 
-                fprintf(stderr, "rcv: DATA: %d, seq=%d, LFR=%d, LAF=%d\n", inbuf[DID], inbuf[DSEQ], /*connection.expected_seq*/LFR,LAF);
-	    if( boxsz(connection.rbox) >= MAX_QUEUE ) 
-            { /* No tengo espacio */
+	else if(inbuf[DTYPE] == DATA && connection.state == CONNECTED) {
+	    if(Data_debug) fprintf(stderr, "rcv: DATA: %d, seq=%d, expected=%d\n", inbuf[DID], inbuf[DSEQ], connection.expected_seq);
+	    if(boxsz(connection.rbox) >= MAX_QUEUE) { /* No tengo espacio */
 		pthread_mutex_unlock(&Dlock);
 		continue;
 	    }
 	/* envio ack en todos los otros casos */
-            
 	    ack[DID] = cl;
 	    ack[DTYPE] = ACK;
-	    ack[DRET] = inbuf[DRET];
-
-            if(seqIsHeigher( LAF, inbuf[DSEQ] )) /* Roberto: para los paquetes que estan sobre la ventana */
-            {
-                ack[DSEQ] = LFR;
-
-                if(send(Dsock, ack, DHDR, 0) <0)
-                    perror("sendack");
-            }
-            
-            else
-            { /* Roberto: los paquetes que estan bajo LAF */
+            if(between(inbuf[DSEQ], connection.expected_seq, (connection.expected_seq + WIN_SZ)%MAX_SEQ)) { /* David: si seq<=LAF... */
                 ack[DSEQ] = inbuf[DSEQ];
-
-            /* enviar a la cola */
-                if(seqIsHeigher(LFR, inbuf[DSEQ])) /* Roberto: ver si esta dentro de la ventana */
-                {
-                    int seqAux = (ReciveBuff.LASTSENDINBOX + getDiff(LFR,inbuf[DSEQ])) % RWS;
-                    wReciveBuff(inbuf, cnt, seqAux);                    
-                }
-/*
-		if(inbuf[DSEQ] == (LFR + 1)%SEQSIZE) {
-		    LFR = (LFR + 1)%SEQSIZE;
-		    LAF = (LFR + RWS)%SEQSIZE;
+	        ack[DCNT] = inbuf[DCNT];
+		if(connection.rcvd[connection.first_rw + (inbuf[DSEQ]-connection.expected_seq)] == 1) { /* David: si ya lo había recibido, entnces es un DUP */
+			connection.dup++;
+			if(Data_debug)
+                    	    fprintf(stderr, "DUP DATA seq %d, expected %d, DUP=%d\n", inbuf[DSEQ], connection.expected_seq, connection.dup);
 		}
-*/
-		/* David: eliminaría lo comentado a continuación */
-                while(ReciveBuff.ack[(ReciveBuff.LASTSENDINBOX+1)%RWS] == 1)/*Roberto: actualizar la ventana*/
-                {
-                    putbox(connection.rbox, ReciveBuff.pending_buf[(ReciveBuff.LASTSENDINBOX+1)%RWS] + DHDR, ReciveBuff.pending_sz[(ReciveBuff.LASTSENDINBOX+1)%RWS]-DHDR);
-                    LFR = (LFR + 1) % SEQSIZE;
-                    LAF = (LAF + 1) % SEQSIZE;
-                    ReciveBuff.LASTSENDINBOX = (ReciveBuff.LASTSENDINBOX+1) % RWS;
-                    ReciveBuff.ack[ReciveBuff.LASTSENDINBOX] = 0;
-                }
+		else { /* David: si es un paquete nuevo */
+			connection.rcvd[connection.first_rw + (inbuf[DSEQ]-connection.expected_seq)] = 1; /* David: se marca en la ventana de recepción */
+			connection.pending_buf[connection.first_rw + (inbuf[DSEQ]-connection.expected_seq)] = inbuf; /* David: almacenamos temporalmente paquete recibido */
+		}
+	    }
+            else {
+                ack[DSEQ] = (connection.expected_seq+MAX_SEQ-1)%MAX_SEQ;
+	        ack[DCNT] = 0; /* Sintetico */
+                connection.dup++; /* David: es un DUP */
+                if(Data_debug)
+                    fprintf(stderr, "DUP DATA seq %d, expected %d, DUP=%d\n", inbuf[DSEQ], connection.expected_seq, connection.dup);
+	    }
+
+	    if(Data_debug) fprintf(stderr, "Enviando ACK %d, seq=%d, retry=%d\n", ack[DID], ack[DSEQ], ack[DCNT]);
+
+	    if(send(Dsock, ack, DHDR, 0) <0)
+		perror("sendack");
+
+        /* si corresponde, enviar a la cola */
+            if(inbuf[DSEQ] == connection.expected_seq) {
+		p = connection.first_rw;
+		while(connection.rcvd[p]) { /* David: se escriben de manera ordenada los paquetes recibidos */
+                	putbox(connection.rbox, (char *)connection.pending_buf[p]+DHDR, cnt-DHDR);
+                	connection.expected_seq = (connection.expected_seq+1)%MAX_SEQ;
+			connection.rcvd[p] = 0;
+			p = (p+1)%WIN_SZ;
+		}
+		connection.first_rw = p;		
             }
-
-	    if(Data_debug) 
-                    fprintf(stderr, "Enviando ACK %d, seq=%d, LFR=%d, LAF=%d\n", ack[DID], ack[DSEQ], LFR, LAF);
-
-            if(send(Dsock, ack, DHDR, 0) <0)
-                    perror("sendack");
         }
-	else if(Data_debug ) {
-	    fprintf(stderr, "descarto paquete entrante: t=%c, id=%d, seq=%d , LAR=%d, LFS=%d\n", inbuf[DTYPE], inbuf[DID],inbuf[DSEQ],LAR,LFS);
-	}
+        else {
+	    if(Data_debug) {
+/* ver si es un ACK fuera de rango y en ese caso asumir un NACK y retransmitir
+   la ventana! */
+                fprintf(stderr, "descarto paquete entrante: t=%c, id=%d, s=%d\n", inbuf[DTYPE], cl, inbuf[DSEQ]);
+	    }
+/*
+ * No debo generar DUP ACK si el ACK duplicado es <= ultimo ack recibido antes del ultimo
+ * timeout (es equivalente a ese timeout): marco con dup_acks = 3 cuando hago timeout?
+ */
+                if(inbuf[DTYPE] == ACK && inbuf[DCNT] == 0) {
+		    if(Data_debug)
+                    fprintf(stderr, "expected_ack=%d, next_seq=%d\n", connection.expected_ack, connection.next_seq);
+		    connection.dup_acks++;
+		    if(connection.dup_acks == 3 &&  /* !empty */
+		      !(connection.first_w == connection.next_w && !connection.full_win)) {
+			connection.timeout[connection.first_w] = Now();
+			connection.dup_ack_timeout = 1;
+	    		pthread_cond_signal(&Dcond);
+			if(Data_debug) fprintf(stderr, "generating DUP ACK timeout!\n");
+		    }
+		}
+        }
 
 	pthread_mutex_unlock(&Dlock);
     }
@@ -456,23 +431,46 @@ static void *Drcvr(void *ppp) {
     return NULL;
 }
 
+int client_retransmit() {
+    int p;
+
+    if(connection.first_w == connection.next_w && !connection.full_win)
+        return 0; /* empty window */
+
+    p=connection.first_w;
+    do {
+        if(connection.timeout[p] <= Now()) {
+            if(Data_debug) fprintf(stderr, "timeout pack: %d, tout=%f, now=%f\n", connection.pending_buf[p][DSEQ], connection.timeout[p], Now());
+            return 1;
+        }
+        p=(p+1)%WIN_SZ;
+    } while(p != connection.next_w);
+
+    return 0;
+}
+
 double Dclient_timeout_or_pending_data() {
     int cl, p;
     double timeout;
 /* Suponemos lock ya tomado! */
 
-    timeout = Now() + getRTT()*1.1;/* David: antes era Now()+20.0 */
-	if(connection.state == FREE) return timeout;
+    timeout = Now()+20.0;
+    if(connection.state == FREE) return timeout;
 
-	if(boxsz(connection.wbox) != 0 && !connection.expecting_ack)
+    if(boxsz(connection.wbox) != 0 && !connection.full_win)
 	/* data from client */
-	    return Now();
+	return Now();
 
-        if(!connection.expecting_ack)
-	    return timeout;
+    if(connection.first_w == connection.next_w && ! connection.full_win)
+	return timeout; /* nothing pending: empty window */
 
-	if(connection.timeout <= Now()) return Now();
-	if(connection.timeout < timeout) timeout = connection.timeout;
+    p=connection.first_w;
+    do {
+	if(connection.timeout[p] <= Now()) return Now();
+	if(connection.timeout[p] < timeout) timeout = connection.timeout[p];
+ 	p=(p+1)%WIN_SZ;
+    } while(p != connection.next_w);
+
     return timeout;
 }
 
@@ -480,117 +478,97 @@ double Dclient_timeout_or_pending_data() {
 static void *Dsender(void *ppp) { 
     double timeout;
     struct timespec tt;
-    int p, k;
+    int i;
+    int p;
     int ret;
 
   
     for(;;) {
 	pthread_mutex_lock(&Dlock);
         /* Esperar que pase algo */
-	while((timeout=BackUp.timeout[(BackUp.LASTSENDINBOX + 1)%SWS]) > Now() ) 
-        {
-// fprintf(stderr, "timeout=%f, now=%f\n", timeout, Now());
-// fprintf(stderr, "Al tuto %f segundos\n", timeout-Now());
+	while((timeout=Dclient_timeout_or_pending_data()) > Now()) {
+ // fprintf(stderr, "timeout=%f, now=%f\n", timeout, Now());
+ // fprintf(stderr, "Al tuto %f segundos\n", timeout-Now());
 	    tt.tv_sec = timeout;
-// fprintf(stderr, "Al tuto %f nanos\n", (timeout-tt.tv_sec*1.0));
+ // fprintf(stderr, "Al tuto %f nanos\n", (timeout-tt.tv_sec*1.0));
 	    tt.tv_nsec = (timeout-tt.tv_sec*1.0)*1000000000;
-// fprintf(stderr, "Al tuto %f segundos, %d secs, %d nanos\n", timeout-Now(), tt.tv_sec, tt.tv_nsec);
-            if(boxsz(connection.wbox) != 0)
-                break;
+ // fprintf(stderr, "Al tuto %f segundos, %d secs, %d nanos\n", timeout-Now(), tt.tv_sec, tt.tv_nsec);
 	    ret=pthread_cond_timedwait(&Dcond, &Dlock, &tt);
-// fprintf(stderr, "volvi del tuto con %d\n", ret);
+ // fprintf(stderr, "volvi del tuto con %d, now=%f\n", ret, Now());
 	}
 
-	/* Revisar clientes: timeouts y datos entrantes */
+	/* Revisar: timeouts y datos entrantes */
 
-        if(connection.state == FREE) continue;
+	    if(connection.state == FREE) pthread_exit(0);
+            if(client_retransmit()) { /* retransmitir toda la ventana */
 
-        if( BackUp.timeout[(BackUp.LASTSENDINBOX + 1)%SWS] < Now() ) 
-        { /* retransmitir */ /* David: basta timeout del primer paquete */
-
-
-            for( k=1; k<=SWS; k++) {
-                    int idx = (k+BackUp.LASTSENDINBOX)%SWS;
-                    if( BackUp.timeout[idx] < Now() ) 
-                    {                          
-                        if( BackUp.ack[idx] == 0 ) 
-                        {
-                            if(Data_debug) 
-                                fprintf(stderr, "TIMEOUT\n");/*Roberto: Lo corri para aca, para que no de mala info*/
-
-                            if( ++BackUp.pending_buf[idx][DRET] > RETRIES ) 
-                            {
-                                fprintf(stderr, "too many retries: %d\n", BackUp.pending_buf[idx][DRET]);
-                                del_connection();
-                                exit(3);
-                            }
-                            send(Dsock, BackUp.pending_buf[idx], DHDR+BackUp.pending_sz[idx], 0);
-                            BackUp.sentTime[idx] = Now();
-                            BackUp.timeout[idx] = BackUp.sentTime[idx] + getRTT()*1.1;
-                            if(Data_debug)
-                                fprintf(stderr, "Re-send DATA %d, seq=%d\n", BackUp.pending_buf[idx][DID], BackUp.pending_buf[idx][DSEQ]);
-                        }
-			break;
-                    }
-            }
-
-        }
-
-        if(boxsz(connection.wbox) != 0 && BackUp.state != CLOSE) 
-        { /* && !connection.expecting_ack) */
-/*
-            Hay un buffer para mi para enviar
-            leerlo, enviarlo, marcar esperando ACK
-*/
-            while(boxsz(connection.wbox) != 0)
-            {
-                if(BackUp.ack[(BackUp.LASTSENDINBOX + 1)%SWS] == 0)
-                    break;
-
-                connection.pending_sz = getbox(connection.wbox, (char *)connection.pending_buf+DHDR, BUF_SIZE); 
-                connection.pending_buf[DID]=connection.id;
-                //connection.expected_ack = (connection.expected_ack+1)%2;
-
-                LFS = (LFS + 1) % SEQSIZE;
-                connection.pending_buf[DSEQ] = LFS;
-                connection.pending_buf[DRET] = 1;
-
-                if(connection.pending_sz == -1) 
-                { /* EOF */ 
-                   if(Data_debug) 
-                       fprintf(stderr, "sending EOF\n");
-                   connection.state = CLOSED;
-                   BackUp.state = CLOSED;
-                   connection.pending_buf[DTYPE]=CLOSE;
-                   connection.pending_sz = 0;
-                   connection.expecting_ack = 0;
+            if(Data_debug) fprintf(stderr, "TIMEOUT: exp_ack=%d, next_seq=%d\n", connection.expected_ack, connection.next_seq);
+	    connection.dup_acks = 3; /* para evitar dups junto con el timeout */
+            p=connection.first_w;
+            do {
+                if(connection.retries[p]++ > RETRIES) {
+                    fprintf(stderr, "%d: too many retries: %d, seq=%d\n", connection.id, connection.retries[p], connection.pending_buf[p][DSEQ]);
+                    del_connection();
+                    pthread_exit(0);
                 }
-                else 
-                {
-                   if(Data_debug) 
-                        fprintf(stderr, "sending DATA id=%d, seq=%d\n", connection.id, connection.pending_buf[DSEQ]);
-                   connection.pending_buf[DTYPE]=DATA;
+		connection.pending_buf[p][DCNT] = connection.retries[p];
+                if(Data_debug) fprintf(stderr, "Re-send DATA, cl=%d, seq=%d, retries=%d\n", connection.id, connection.pending_buf[p][DSEQ], connection.pending_buf[p][DCNT]);
+                if(send(Dsock, connection.pending_buf[p], DHDR+connection.pending_sz[p], 0) < 0) {
+                    perror("sendto1"); exit(1);
                 }
+/* timer backoff solo una vez por ventana y solo si no es retrans por dup_ack */
+		if(p == connection.first_w && !connection.dup_ack_timeout) { /* first time */
+		    connection.rtimeout *= 2;
+		    if(connection.rtimeout > MAXTIMEOUT)
+		    	connection.rtimeout = MAXTIMEOUT;
 
-                BackUp.LASTSENDINBOX = (BackUp.LASTSENDINBOX + 1) % SWS;
-		BackUp.sentTime[BackUp.LASTSENDINBOX] = Now(); /* David: tiempo inicial primer envío */
-		BackUp.ack[BackUp.LASTSENDINBOX] = 0;
-
-                if(send(Dsock, connection.pending_buf, DHDR+connection.pending_sz, 0) < 0) {
-		    perror("no se pudo enviar el paquete\n");
-		    exit(1);
+		    if(Data_debug) fprintf(stderr, "Dup timeout=%f\n", connection.rtimeout);
 		}
 
-                wBackUp(connection.pending_buf, connection.pending_sz, BackUp.LASTSENDINBOX);
+		connection.dup_ack_timeout = 0;
+		connection.stime[p] = Now();
+		connection.timeout[p] = connection.stime[p] + connection.rtimeout;
 
-                connection.expecting_ack = 1;
-                /*connection.timeout = Now() + getRTT()*1.1;*/
-                BackUp.timeout[BackUp.LASTSENDINBOX] = BackUp.sentTime[BackUp.LASTSENDINBOX] + getRTT()*1.1;
-                connection.retries = 0;
+                p=(p+1)%WIN_SZ;
+            } while(p != connection.next_w);
             }
-        }
+            if(boxsz(connection.wbox) != 0 && !connection.full_win) {
+/*
+                Hay un buffer para mi para enviar
+                leerlo, enviarlo, marcar esperando ACK
+*/
+                p = connection.next_w;
+                connection.pending_sz[p] = getbox(connection.wbox, (char *)connection.pending_buf[p]+DHDR, BUF_SIZE);
+                connection.pending_buf[p][DID]=connection.id;
+                connection.pending_buf[p][DSEQ]=connection.next_seq;
+                connection.pending_buf[p][DCNT]=1;
+                connection.next_seq = (connection.next_seq+1)%MAX_SEQ;
+                connection.next_w = (connection.next_w+1)%WIN_SZ;
+                if(connection.next_w == connection.first_w)
+                    connection.full_win = 1;
+
+                if(connection.pending_sz[p] == -1) { /* EOF */
+                if(Data_debug) fprintf(stderr, "sending EOF\n");
+                   connection.state = CLOSED;
+                   connection.pending_buf[p][DTYPE]=CLOSE;
+                   connection.pending_sz[p] = 0;
+fprintf(stderr, "closing %d, dups=%d\n", connection.id, connection.dup);
+                }
+                else {
+                   if(Data_debug)
+                        fprintf(stderr, "sending DATA id=%d, seq=%d\n", connection.id, connection.pending_buf[p][DSEQ] );
+                   connection.pending_buf[p][DTYPE]=DATA;
+                }
+
+if(Data_debug) print_win();
+
+                sendto(Dsock, connection.pending_buf[p], DHDR+connection.pending_sz[p], 0, NULL, 0);
+
+		connection.stime[p] = Now();
+		connection.timeout[p] = connection.stime[p] + connection.rtimeout;
+		connection.retries[p] = 1;
+	    }
 	pthread_mutex_unlock(&Dlock);
     }
-    return NULL;
+    return NULL; /* unreachable */
 }
-
