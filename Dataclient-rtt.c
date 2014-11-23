@@ -300,7 +300,7 @@ static void *Drcvr(void *ppp) {
 	}
 /* Un Ack: trabajamos para el enviador */
 	else if(inbuf[DTYPE] == ACK && connection.state != FREE
-                && between(inbuf[DSEQ], connection.expected_ack, connection.next_seq)) /*(connection.expected_ack+WIN_SZ-1)%MAX_SEQ))*/ {
+                && between(inbuf[DSEQ], connection.expected_ack, (connection.next_seq + MAX_SEQ - 1)%MAX_SEQ)) /*(connection.expected_ack+WIN_SZ-1)%MAX_SEQ))*/ {
         /* liberar buffers entre expected_ack e inbuf[DSEQ] */
 
 		connection.dup_acks = 0;
@@ -362,7 +362,7 @@ static void *Drcvr(void *ppp) {
 		}
 	    }*/
 
-	    while(connection.acked[connection.first_w] && !connection.full_win && connection.first_w != connection.next_w) { /* David: ACKn no implica haber recibido ACKn-1 */
+	    while(connection.acked[connection.first_w]) /*&& connection.first_w != connection.next_w)*/ { /* David: ACKn no implica haber recibido ACKn-1 */
 		printf("DAVID\n");
                 connection.first_w = (connection.first_w + 1)%WIN_SZ;
                 connection.expected_ack = (connection.expected_ack + 1)%MAX_SEQ;
