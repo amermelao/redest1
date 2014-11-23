@@ -54,7 +54,7 @@ struct {
     unsigned char first_w, next_w; /* window pointers */
     unsigned char first_rw; /* David: puntero del primer paquete en ventana de recepción */
     int full_win;                  /* signals fullwin to disambiguate when first==next */
-    unsigned char expected_seq, expected_ack, next_seq;
+    unsigned char expected_seq, expected_ack, next_seq, next_rseq; /* David: se agrega 'next_rseq' para ventana de recepción */
     int state;
     int id;
     double rtt, rdev, rtimeout, stime[WIN_SZ];
@@ -131,7 +131,7 @@ int init_connection(int id) {
 	connection.rcvd[i] = 0; /* David: todavía no se reciben paquetes de datos */
     }
     connection.expected_ack = 1;
-    connection.next_seq = 1;
+    connection.next_seq = connection.next_rseq = 1; /* David: next_seq para ventana de recepción */
     connection.expected_seq = 0;
     connection.first_w = connection.next_w = 0;
     connection.first_rw = 0; /* David: puntero de ventana de recepción */
@@ -371,6 +371,7 @@ static void *Drcvr(void *ppp) {
 	    pthread_cond_signal(&Dcond);
 	}
 	else if(inbuf[DTYPE] == DATA && connection.state == CONNECTED) {
+
 	    if(Data_debug) fprintf(stderr, "rcv: DATA: %d, seq=%d, expected=%d\n", inbuf[DID], inbuf[DSEQ], connection.expected_seq);
 	    if(boxsz(connection.rbox) >= MAX_QUEUE) { /* No tengo espacio */
 		pthread_mutex_unlock(&Dlock);
@@ -382,14 +383,15 @@ static void *Drcvr(void *ppp) {
             if(between(inbuf[DSEQ], connection.expected_seq, (connection.expected_seq + WIN_SZ - 1)%MAX_SEQ)) { /* David: si seq<=LAF... */
                 ack[DSEQ] = inbuf[DSEQ];
 	        ack[DCNT] = inbuf[DCNT];
-		if(connection.rcvd[connection.first_rw + (inbuf[DSEQ]-connection.expected_seq)] == 1) { /* David: si ya lo había recibido, entonces es un DUP */
+                p = ( connection.first_rw + (inbuf[DSEQ] + MAX_SEQ - connection.expected_seq)%MAX_SEQ )%WIN_SZ;
+		if(connection.rcvd[p] == 1) { /* David: si ya lo había recibido, entonces es un DUP */
 			connection.dup++;
 			if(Data_debug)
                     	    fprintf(stderr, "DUP DATA seq %d, expected %d, DUP=%d\n", inbuf[DSEQ], connection.expected_seq, connection.dup);
 		}
 		else { /* David: si es un paquete nuevo */
-			connection.rcvd[connection.first_rw + (inbuf[DSEQ]-connection.expected_seq)] = 1; /* David: se marca en la ventana de recepción */
-			memcpy(connection.pending_buf[connection.first_rw + (inbuf[DSEQ]-connection.expected_seq)], inbuf, cnt); /* David: almacenamos temporalmente paquete recibido */
+			connection.rcvd[p] = 1; /* David: se marca en la ventana de recepción */
+			memcpy(connection.pending_buf[p], inbuf, cnt); /* David: almacenamos temporalmente paquete recibido */
 		}
 	    }
             else {
@@ -411,6 +413,7 @@ static void *Drcvr(void *ppp) {
 		while(connection.rcvd[p]) { /* David: se escriben de manera ordenada los paquetes recibidos */
                 	putbox(connection.rbox, (char *)connection.pending_buf[p]+DHDR, cnt-DHDR);
                 	connection.expected_seq = (connection.expected_seq+1)%MAX_SEQ;
+			connection.first_rw = (connection.first_rw+1)%WIN_SZ;
 			connection.rcvd[p] = 0;
 			p = (p+1)%WIN_SZ;
 		}
@@ -531,7 +534,7 @@ static void *Dsender(void *ppp) {
 		connection.pending_buf[p][DCNT] = connection.retries[p];
                 if(Data_debug) fprintf(stderr, "Re-send DATA, cl=%d, seq=%d, retries=%d | EXP_ACK=%d, FIRST=%d, P=%d, FULL_WIN=%d\n", connection.id, connection.pending_buf[p][DSEQ], connection.pending_buf[p][DCNT],connection.expected_ack, connection.first_w, p, connection.full_win);
 		//if(connection.acked[p] == 1) { /* David: si ya se recibió el ack del respectivo paquete, no retransmitirlo */
-		  //  p=(p+1)%WIN_SZ;
+		    //p=(p+1)%WIN_SZ;
 		    //continue;
 		//}
                 if(send(Dsock, connection.pending_buf[p], DHDR+connection.pending_sz[p], 0) < 0) {
