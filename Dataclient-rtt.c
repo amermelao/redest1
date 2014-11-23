@@ -265,9 +265,9 @@ static void *Drcvr(void *ppp) {
 
 	cl = inbuf[DID];
 	if(cl != connection.id) continue;
-printf("PEGADO EN EL RECEIVER\n");
+//printf("PEGADO EN EL RECEIVER\n");
 	pthread_mutex_lock(&Dlock);
-printf("DESPEGADO EN EL RECEIVER\n"); 
+//printf("DESPEGADO EN EL RECEIVER\n"); 
 	if(inbuf[DTYPE] == CLOSE) { /* muy parecido a DATA */
 	    if(Data_debug) fprintf(stderr, "rcv: CLOSE: %d, seq=%d, expected=%d\n\n", cl, inbuf[DSEQ], connection.expected_seq);
 
@@ -345,6 +345,7 @@ printf("DESPEGADO EN EL RECEIVER\n");
                connection.first_w == connection.next_w &&
                !connection.full_win) {
                 /* conexion cerrada y sin buffers pendientes */
+
                 del_connection();
             }
 
@@ -360,7 +361,9 @@ printf("DESPEGADO EN EL RECEIVER\n");
 		    }
 		}
 	    }*/
-	    while(connection.acked[connection.first_w]) { /* David: ACKn no implica haber recibido ACKn-1 */
+
+	    while(connection.acked[connection.first_w] && !connection.full_win && connection.first_w != connection.next_w) { /* David: ACKn no implica haber recibido ACKn-1 */
+		printf("DAVID\n");
                 connection.first_w = (connection.first_w + 1)%WIN_SZ;
                 connection.expected_ack = (connection.expected_ack + 1)%MAX_SEQ;
             }
@@ -466,7 +469,7 @@ double Dclient_timeout_or_pending_data() {
     int cl, p;
     double timeout;
 /* Suponemos lock ya tomado! */
-printf("FULL_WIN=%d\n");
+
     timeout = Now()+20.0;
     if(connection.state == FREE) return timeout;
 
@@ -506,11 +509,11 @@ static void *Dsender(void *ppp) {
  // fprintf(stderr, "Al tuto %f nanos\n", (timeout-tt.tv_sec*1.0));
 	    tt.tv_nsec = (timeout-tt.tv_sec*1.0)*1000000000;
  // fprintf(stderr, "Al tuto %f segundos, %d secs, %d nanos\n", timeout-Now(), tt.tv_sec, tt.tv_nsec);
-	    printf("PEGADO EN SENDER\n");
+//	    printf("PEGADO EN SENDER\n");
 	    ret=pthread_cond_timedwait(&Dcond, &Dlock, &tt);
  // fprintf(stderr, "volvi del tuto con %d, now=%f\n", ret, Now());
 	}
-printf("DESPEGADO EN SENDER\n");
+//printf("DESPEGADO EN SENDER\n");
 	/* Revisar: timeouts y datos entrantes */
 
 	    if(connection.state == FREE) pthread_exit(0);
