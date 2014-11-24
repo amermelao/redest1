@@ -54,7 +54,7 @@ struct {
     unsigned char first_w, next_w; /* window pointers */
     unsigned char first_rw; /* David: puntero del primer paquete en ventana de recepción */
     int full_win;                  /* signals fullwin to disambiguate when first==next */
-    unsigned char expected_seq, expected_ack, next_seq, next_rseq; /* David: se agrega 'next_rseq' para ventana de recepción */
+    unsigned char expected_seq, expected_rseq, expected_ack, next_seq; /* David: se agrega 'expected_rseq' para ventana de recepción */
     int state;
     int id;
     double rtt, rdev, rtimeout, stime[WIN_SZ];
@@ -63,6 +63,7 @@ struct {
     int dup_ack_timeout; /* flag para anotar cuando ocurrió un fast retransmit y evitar un timeout extra */
     int acked[WIN_SZ]; /* David: marcador de paquetes enviados confirmados (ventana de envío) */
     int rcvd[WIN_SZ]; /* David: marcador de paquetes recibidos (ventana de recepción) */
+    int ack_dif; /* David: contador de ACKs diferentes del esperado para Fast Retransmit */
 } connection;
 
 /* Funciones utilitarias */
@@ -130,8 +131,8 @@ int init_connection(int id) {
 	connection.acked[i] = 0; /* David: todavía no se reciben ACKs */
 	connection.rcvd[i] = 0; /* David: todavía no se reciben paquetes de datos */
     }
-    connection.expected_ack = 1;
-    connection.next_seq = connection.next_rseq = 1; /* David: next_seq para ventana de recepción */
+    connection.expected_ack = connection.expected_rseq = 1;
+    connection.next_seq = 1;
     connection.expected_seq = 0;
     connection.first_w = connection.next_w = 0;
     connection.first_rw = 0; /* David: puntero de ventana de recepción */
@@ -143,6 +144,7 @@ int init_connection(int id) {
     connection.dup_acks = 0;
     connection.dup_ack_timeout = 0;
     connection.id = id;
+    connection.ack_dif = 0;
     return id;
 }
 
@@ -349,21 +351,16 @@ static void *Drcvr(void *ppp) {
                 del_connection();
             }
 
-	    if(inbuf[DSEQ] == connection.expected_ack) /* David: hay espacio en la ventana si es que recibí el ack esperado */
+	    if(inbuf[DSEQ] == connection.expected_ack) { /* David: hay espacio en la ventana si es que recibí el ack esperado */
                 connection.full_win = 0;
-	    /*else {
-		connection.full_win = 1;
-		p = connection.first_w;
-		while(p != connection.next_w) {
-		    if(connection.acked[p] == 0) {
-			connection.full_win = 0;
-			break;
-		    }
-		}
-	    }*/
+		connection.ack_dif = 0;
+	    }
+	    else
+		connection.ack_dif++; /* David: sumamos 1 al contador de ACKs diferentes al esperado para Fast Retransmit */
 
 	    while(connection.acked[connection.first_w]) /*&& connection.first_w != connection.next_w)*/ { /* David: ACKn no implica haber recibido ACKn-1 */
 		printf("DAVID\n");
+		connection.acked[connection.first_w] = 0;
                 connection.first_w = (connection.first_w + 1)%WIN_SZ;
                 connection.expected_ack = (connection.expected_ack + 1)%MAX_SEQ;
             }
@@ -417,7 +414,6 @@ static void *Drcvr(void *ppp) {
 			connection.rcvd[p] = 0;
 			p = (p+1)%WIN_SZ;
 		}
-		connection.first_rw = p;		
             }
         }
         else {
@@ -457,8 +453,10 @@ int client_retransmit() {
         return 0; /* empty window */
 
     p=connection.first_w;
+    if(connection.ack_dif > 3) /* David: Fast Retransmit */
+	return 1;
     do {
-        if(connection.timeout[p] <= Now()) {
+        if(connection.timeout[p] <= Now() && connection.acked[p] == 0) { /* David: se agrega "connection.acked[p]==0" */
             if(Data_debug) fprintf(stderr, "timeout pack: %d, tout=%f, now=%f | FIRST=%d\n", connection.pending_buf[p][DSEQ], connection.timeout[p], Now(), connection.first_w);
             return 1;
         }
@@ -485,6 +483,10 @@ double Dclient_timeout_or_pending_data() {
 
     p=connection.first_w;
     do {
+	if(connection.acked[p] == 1) { /* David: se agrega condición para no hacer TIMEOUT con paquetes ya recibidos */
+	    p=(p+1)%WIN_SZ;
+	    continue;
+	}
 	if(connection.timeout[p] <= Now()) return Now();
 	if(connection.timeout[p] < timeout) timeout = connection.timeout[p];
  	p=(p+1)%WIN_SZ;
@@ -526,6 +528,10 @@ static void *Dsender(void *ppp) {
 	    connection.dup_acks = 3; /* para evitar dups junto con el timeout */
             p=connection.first_w;
             do {
+		if(connection.acked[p] == 1) { /* David: si ya se recibió el ack del respectivo paquete, no retransmitirlo */
+                    p=(p+1)%WIN_SZ;
+                    continue;
+                }
                 if(connection.retries[p]++ > RETRIES) {
                     fprintf(stderr, "%d: too many retries: %d, seq=%d\n", connection.id, connection.retries[p], connection.pending_buf[p][DSEQ]);
                     del_connection();
@@ -533,10 +539,6 @@ static void *Dsender(void *ppp) {
                 }
 		connection.pending_buf[p][DCNT] = connection.retries[p];
                 if(Data_debug) fprintf(stderr, "Re-send DATA, cl=%d, seq=%d, retries=%d | EXP_ACK=%d, FIRST=%d, P=%d, FULL_WIN=%d\n", connection.id, connection.pending_buf[p][DSEQ], connection.pending_buf[p][DCNT],connection.expected_ack, connection.first_w, p, connection.full_win);
-		//if(connection.acked[p] == 1) { /* David: si ya se recibió el ack del respectivo paquete, no retransmitirlo */
-		    //p=(p+1)%WIN_SZ;
-		    //continue;
-		//}
                 if(send(Dsock, connection.pending_buf[p], DHDR+connection.pending_sz[p], 0) < 0) {
                     perror("sendto1"); exit(1);
                 }
@@ -568,7 +570,7 @@ static void *Dsender(void *ppp) {
                 connection.pending_buf[p][DCNT]=1;
                 connection.next_seq = (connection.next_seq+1)%MAX_SEQ;
                 connection.next_w = (connection.next_w+1)%WIN_SZ;
-		connection.acked[p] = 0; /* David: se marca como no confirmado */
+		//connection.acked[p] = 0; /* David: se marca como no confirmado */
                 if(connection.next_w == connection.first_w)
                     connection.full_win = 1;
 
