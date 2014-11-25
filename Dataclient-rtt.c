@@ -263,7 +263,7 @@ static void *Drcvr(void *ppp) {
     while((cnt=recv(Dsock, inbuf, BUF_SIZE, 0)) > 0) {
    	if(Data_debug)
 	    fprintf(stderr, "recv: id=%d, type=%c, seq=%d, retries=%d | EXP_ACK=%d, NEXT_SEQ=%d\n", inbuf[DID], inbuf[DTYPE], inbuf[DSEQ], inbuf[DCNT], connection.expected_ack, connection.next_seq);
-	if(cnt < DHDR) continue;
+	if(cnt < DHDR){ fprintf(stderr,"NO ENTREEEEEEE\n");continue;}
 
 	cl = inbuf[DID];
 	if(cl != connection.id) continue;
@@ -302,7 +302,7 @@ static void *Drcvr(void *ppp) {
 	}
 /* Un Ack: trabajamos para el enviador */
 	else if(inbuf[DTYPE] == ACK && connection.state != FREE
-                && between(inbuf[DSEQ], connection.expected_ack, (connection.next_seq + MAX_SEQ - 1)%MAX_SEQ)) /*(connection.expected_ack+WIN_SZ-1)%MAX_SEQ))*/ {
+                && ( between(inbuf[DSEQ], connection.expected_ack, connection.next_seq) /*|| inbuf[DSEQ] == connection.expected_ack*/ )) /*(connection.expected_ack+WIN_SZ-1)%MAX_SEQ))*/ {
         /* liberar buffers entre expected_ack e inbuf[DSEQ] */
 
 		connection.dup_acks = 0;
@@ -320,6 +320,8 @@ static void *Drcvr(void *ppp) {
                 if(connection.pending_buf[p][DSEQ] == inbuf[DSEQ]) {
                     found = 1;
 		    connection.acked[p] = 1; /* David: marcamos la recepción del paquete */
+		    //if(connection.pending_buf[p][DTYPE] == CLOSE)
+		//	connection.state = CLOSE;
                     break;
                 }
                 p=(p+1)%WIN_SZ;
@@ -377,7 +379,7 @@ static void *Drcvr(void *ppp) {
 	/* envio ack en todos los otros casos */
 	    ack[DID] = cl;
 	    ack[DTYPE] = ACK;
-            if(between(inbuf[DSEQ], connection.expected_seq, (connection.expected_seq + WIN_SZ - 1)%MAX_SEQ)) { /* David: si seq<=LAF... */
+            if(between(inbuf[DSEQ], connection.expected_seq, (connection.expected_seq + WIN_SZ)%MAX_SEQ)) { /* David: si seq<=LAF... */
                 ack[DSEQ] = inbuf[DSEQ];
 	        ack[DCNT] = inbuf[DCNT];
                 p = ( connection.first_rw + (inbuf[DSEQ] + MAX_SEQ - connection.expected_seq)%MAX_SEQ )%WIN_SZ;
@@ -500,7 +502,7 @@ static void *Dsender(void *ppp) {
     double timeout;
     struct timespec tt;
     int i;
-    int p;
+    int p, paux, found;
     int ret;
 
   
@@ -532,6 +534,20 @@ static void *Dsender(void *ppp) {
                     p=(p+1)%WIN_SZ;
                     continue;
                 }
+		if(connection.pending_sz[p] == 0) {
+		    found = 0;
+            	    paux = connection.first_w;
+            	    while(paux != p) {
+                	if(connection.acked[paux] == 0) {
+                    	    found = 1;
+                    	    break;
+			}
+			paux=(paux+1)%WIN_SZ;
+                    }
+		    if(found)
+			break;
+		    //connection.state = CLOSE;
+		}
                 if(connection.retries[p]++ > RETRIES) {
                     fprintf(stderr, "%d: too many retries: %d, seq=%d\n", connection.id, connection.retries[p], connection.pending_buf[p][DSEQ]);
                     del_connection();
@@ -574,20 +590,38 @@ static void *Dsender(void *ppp) {
                 if(connection.next_w == connection.first_w)
                     connection.full_win = 1;
 
+		found = 0;
+
                 if(connection.pending_sz[p] == -1) { /* EOF */
-                if(Data_debug) fprintf(stderr, "sending EOF\n");
-                   connection.state = CLOSED;
-                   connection.pending_buf[p][DTYPE]=CLOSE;
-                   connection.pending_sz[p] = 0;
-		fprintf(stderr, "closing %d, dups=%d\n", connection.id, connection.dup);
+                    connection.pending_buf[p][DTYPE]=CLOSE;
+                    connection.pending_sz[p] = 0;
+                    paux = connection.first_w;
+                    while(paux != p) {
+                        if(connection.acked[paux] == 0) {
+                            found = 1;
+                            break;
+                        }
+                        paux=(paux+1)%WIN_SZ;
+                    }
+		    if(!found) {
+			if(Data_debug) fprintf(stderr, "sending EOF\n");
+			//connection.state = CLOSED;
+		        fprintf(stderr, "closing %d, dups=%d\n", connection.id, connection.dup);
+		    }
                 }
                 else {
-                   if(Data_debug)
+                    if(Data_debug)
                         fprintf(stderr, "sending DATA id=%d, seq=%d\n", connection.id, connection.pending_buf[p][DSEQ] );
-                   connection.pending_buf[p][DTYPE]=DATA;
+                    connection.pending_buf[p][DTYPE]=DATA;
                 }
 
 		if(Data_debug) print_win();
+
+		if(connection.pending_buf[p][DTYPE] == CLOSE && found) {
+		    connection.next_seq = (connection.next_seq+MAX_SEQ-1)%MAX_SEQ;
+                    connection.next_w = (connection.next_w+WIN_SZ-1)%WIN_SZ;
+		    continue;
+		}
 
                 sendto(Dsock, connection.pending_buf[p], DHDR+connection.pending_sz[p], 0, NULL, 0);
 
@@ -599,4 +633,3 @@ static void *Dsender(void *ppp) {
     }
     return NULL; /* unreachable */
 }
-
